@@ -1,11 +1,13 @@
 
 #!/usr/bin/env python3
-"""SK System Telegram signal bot.
+"""SK System Telegram signal bot — стратегия 0->A->B (SK v6), спот, только лонг.
 
-Universe: top-N by market cap (CoinGecko) x active USDT spot pairs (Binance).
-Every hour, right after the 1h candle closes, each symbol's Tracker is fed the
-new bar: impulse scan -> zone 0.5-0.786 -> trigger 0.559 -> entry on close.
-Open positions are managed by the %-rules (TP1 50% / TP2 25% / trailing SL).
+Universe: топ-200 USDT-пар Binance по суточному объёму (обновляется раз в 6 ч).
+Timeframe: 1h. Каждый раунд (5 мин) новым закрытым свечам каждого символа
+скармливается SKTracker: детекция 0->A->B -> сигнал в точке B (касание зоны
+0.5-0.786) -> вход $100 с капитала $1000 (макс. 10 позиций).
+Money management: TP1 +2% на 30%, TP2 1.618 на 30%, TP3 2.0 на 40%,
+SL: закрытие ниже B / пробой точки 0 (аварийный стоп).
 
 Web dashboard (app/web.py) reads data/state.json and writes data/cmd.json;
 this bot applies those commands. Env + data/config.json override strategy
@@ -24,9 +26,10 @@ import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.engine_ob import ObParams, ObTracker
+from app.strategy_0ab import SParams, SKTracker
 from app.market import (fetch_klines, fetch_history, load_universe, build_exchange_map,
-                        fetch_klines_ex, ping_exchange, EXCHANGES)
+                        fetch_klines_ex, ping_exchange, EXCHANGES,
+                        fetch_binance_top_usdt, fetch_kucoin_top_usdt)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sksystem")
@@ -34,9 +37,9 @@ log = logging.getLogger("sksystem")
 DATA = os.environ.get("DATA_DIR", "/app/data")
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHATS = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
-TF = os.environ.get("TF", "4h")
+TF = os.environ.get("TF", "1h")
 if TF not in ("1h", "4h"):
-    TF = "4h"
+    TF = "1h"
 SECONDS = {"1h": 3600, "4h": 14400}
 TOP_N = int(os.environ.get("TOP_N", "200"))
 MAX_POS = int(os.environ.get("MAX_POSITIONS", "10"))
@@ -53,14 +56,20 @@ KB = {"keyboard": [["📊 Daily", "💰 Profit", "🏦 Balance"],
 os.makedirs(DATA, exist_ok=True)
 
 
-def cfg() -> ObParams:
+def cfg() -> SParams:
     """Params from env, overridden by data/config.json (live-tunable)."""
-    p = ObParams(
-        sl_buffer_pct=float(os.environ.get("SL_BUFFER_PCT", "2.0")),
-        min_rr=float(os.environ.get("MIN_RR", "0.5")),
-        timeout_bars=int(os.environ.get("TIMEOUT_BARS", "36")),
-        leverage=float(os.environ.get("LEVERAGE", "3.0")),
-        risk_pct=float(os.environ.get("RISK_PCT", "1.0")),
+    p = SParams(
+        entry_usd=float(os.environ.get("ENTRY_USD", "100")),
+        capital_usd=float(os.environ.get("CAPITAL_USD", "1000")),
+        tp1_pct=float(os.environ.get("TP1_PCT", "2.0")),
+        tp1_frac=float(os.environ.get("TP1_FRAC", "0.30")),
+        tp2_frac=float(os.environ.get("TP2_FRAC", "0.30")),
+        tp3_frac=float(os.environ.get("TP3_FRAC", "0.40")),
+        entry_mode=os.environ.get("ENTRY_MODE", "zone"),
+        min_impulse_atr=float(os.environ.get("MIN_IMPULSE_ATR", "1.5")),
+        zone_min=float(os.environ.get("ZONE_MIN", "0.5")),
+        zone_max=float(os.environ.get("ZONE_MAX", "0.786")),
+        life_active=int(os.environ.get("LIFE_ACTIVE", "150")),
     )
     path = os.path.join(DATA, "config.json")
     if os.path.exists(path):
@@ -172,43 +181,52 @@ def make_chart(symbol, df, pos):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
-    d = df.tail(48).reset_index(drop=True)
+    d = df.tail(72).reset_index(drop=True)
     up, dn = "#26a69a", "#ef5350"
     fig, ax = plt.subplots(figsize=(6.4, 4.2), dpi=110)
     fig.patch.set_facecolor("#0d1117")
-    ax.set_facecolor("#10231a" if pos["dir"] == 1 else "#2a1518")
+    ax.set_facecolor("#10231a")
     for i, r in d.iterrows():
         cnd = up if r["close"] >= r["open"] else dn
         ax.plot([i, i], [r["low"], r["high"]], color=cnd, lw=0.8, zorder=2)
         lo_, hi_ = min(r["open"], r["close"]), max(r["open"], r["close"])
         ax.add_patch(Rectangle((i - 0.32, lo_), 0.64, max(hi_ - lo_, 1e-9),
                                facecolor=cnd, edgecolor=cnd, zorder=3))
-    off = len(df) - 48
-    x_box = max(pos.get("box_born", off) - off, 0)
-    bt, bb = max(pos["box_top"], pos["box_bottom"]), min(pos["box_top"], pos["box_bottom"])
-    ax.add_patch(Rectangle((x_box, bb), len(d) - x_box + 4, bt - bb,
-                           facecolor="#ffd54a", alpha=0.14,
-                           edgecolor="#ffd54a", lw=1.0, zorder=1))
-    ax.text(x_box + 0.3, bt, "block", color="#d29922", fontsize=8, va="bottom")
+    # «зелёный блок»: цели 1.618 / 1.809 / 2.0 от B
+    lv = pos.get("lv") or []
+    if lv:
+        top = max(px for _, px in lv)
+        bot = min(px for _, px in lv)
+        off = len(df) - 72
+        x0 = max(int(pos.get("opened_i", len(df))) - off, 0)
+        ax.add_patch(Rectangle((x0, bot), len(d) - x0 + 4, top - bot,
+                               facecolor="#26a69a", alpha=0.13,
+                               edgecolor="#26a69a", lw=1.0, zorder=1))
+        ax.text(x0 + 0.3, top, "block TP", color="#3fb68b", fontsize=8, va="bottom")
+        for k, (name, y) in enumerate(lv):
+            ax.hlines(y, -1, len(d), colors="#2ea87e", linestyles=":", lw=1.0)
+            ax.text(len(d) - 0.5, y, f"{name}  {fmt_px(y)}",
+                    color="#7ee0bb", fontsize=7, va="center", ha="right",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="#0d1117", ec="#2ea87e", lw=0.5))
     xmin, xmax = -1, len(d)
     rows = [(pos["entry"], "#ffd54a", "ENTRY", "--"),
-            (pos["tp"], up, "TP", "-"),
-            (pos["sl"], dn, "SL", "-")]
+            (pos["tp1"], up, "TP1 +2%", "-"),
+            (pos["fail_px"], dn, "SL (close<B)", "-"),
+            (pos["cat_sl"], "#b04a4a", "SL catastr (0)", ":")]
     for y, c_, name, st in rows:
-        pct = (y - pos["entry"]) / pos["entry"] * 100 * pos["dir"]
+        pct = (y - pos["entry"]) / pos["entry"] * 100
         ax.hlines(y, xmin, xmax, colors=c_, linestyles=st, lw=1.4)
         ax.text(xmax - 0.5, y, f"{name}  {fmt_px(y)}  ({pct:+.1f}%)", color=c_,
                 fontsize=8, va="center", ha="right",
                 bbox=dict(boxstyle="round,pad=0.25", fc="#0d1117", ec=c_, lw=0.6))
-    side = "LONG" if pos["dir"] == 1 else "SHORT"
-    ax.set_title(f"#{symbol} · {TF} · {side} · order block", color="#e6edf3",
+    ax.set_title(f"#{symbol} · {TF} · LONG · SK 0→A→B", color="#e6edf3",
                  fontsize=10, loc="left")
     ax.tick_params(colors="#8b949e", labelsize=7)
     for sp in ax.spines.values():
         sp.set_color("#30363d")
     ax.set_xlim(xmin, xmax)
     ax.grid(color="#21262d", lw=0.5)
-    fig.text(0.01, 0.01, "SK System | order blocks | target: opposite block | SL: block + 2%",
+    fig.text(0.01, 0.01, "SK System | 0→A→B | сигнал в точке B | TP1 +2%/30% · 1.618/30% · 2.0/40% | SL: закрытие<B",
              color="#8b949e", fontsize=7)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
@@ -286,7 +304,7 @@ def process_symbol(symbol, p):
     if symbol not in cache:
         cache[symbol] = load_symbol(symbol)
         STATE["processed"][symbol] = len(cache[symbol]) - 2
-        STATE["trackers"][symbol] = ObTracker(p)
+        STATE["trackers"][symbol] = SKTracker(p)
         return
     df = cache[symbol]
     ex = STATE["exch"].get(symbol) or "binance"
@@ -306,58 +324,92 @@ def process_symbol(symbol, p):
     tr = STATE["trackers"][symbol]
     for i in range(STATE["processed"][symbol] + 1, last_closed + 1):
         for ev in tr.update(hv, lv, ov, cv, i):
-            if ev[0] == "entry":
-                _, d, entry, sl, tp, box = ev
+            if ev[0] == "sig":
+                _, entry, info = ev
                 if STATE["paused"] or len(book.open) >= MAX_POS or symbol in book.open:
                     continue
-                open_pos(symbol, d, entry, sl, tp, box, df, p)
+                open_pos(symbol, entry, info, df, p)
+            elif ev[0] == "part" and symbol in book.open:
+                _, px, frac, label = ev
+                part_pos(symbol, book.open[symbol], float(px), float(frac), label, p)
             elif ev[0] == "exit" and symbol in book.open:
                 _, px, reason = ev
                 close_pos(symbol, book.open[symbol], float(px), reason, p)
     STATE["processed"][symbol] = last_closed
 
 
-def open_pos(symbol, d, entry, sl, tp, box, df, p):
-    side = "🟢 LONG 📈" if d == 1 else "🔴 SHORT 📉"
-    qty = p.margin_usd * p.leverage / entry
-    pos = {"dir": d, "entry": entry, "sl": sl, "tp": tp, "opened": time.time(),
-           "box_top": box.top, "box_bottom": box.bottom, "box_born": box.born,
-           "qty": qty, "margin": p.margin_usd}
+def _fees(notional, p):
+    return notional * p.fee_pct / 100.0 * 2   # вход + выход
+
+
+def open_pos(symbol, entry, info, df, p):
+    pos = {"dir": 1, "entry": entry, "opened": time.time(),
+           "p0": info["p0"], "pA": info["pA"], "pB": info["pB"],
+           "fail_px": info["fail_px"], "cat_sl": info["cat_sl"],
+           "tp1": info["tp1"], "lv": [(lv, px) for lv, px in info["lv"]],
+           "left_frac": 1.0, "entry_usd": p.entry_usd,
+           "opened_i": int(info["opened_i"])}
     book.trade_no += 1
     book.signals += 1
+    STATE["entries"] = STATE.get("entries", 0) + 1
     pp = book.per_pair.setdefault(symbol, {"signals": 0, "closed": 0, "wins": 0,
                                            "losses": 0, "pnl": 0.0})
     pp["signals"] += 1
     book.open[symbol] = pos
     book.save()
-    log.info("signal %s %s entry=%s sl=%s tp=%s", symbol, d, entry, sl, tp)
-    log_event("OPEN " + ("LONG" if d == 1 else "SHORT") + " #" + symbol + " @ " + fmt_px(entry))
-    rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
+    log.info("signal %s entry=%s p0=%s pA=%s", symbol, entry, info["p0"], info["pA"])
+    log_event("OPEN LONG #" + symbol + " @ " + fmt_px(entry))
+    block = " · ".join(f"{lv} → {fmt_px(px)} ({(px - entry) / entry * 100:+.1f}%)"
+                       for lv, px in pos["lv"])
     tg_photo(make_chart(symbol, df, pos), NL.join([
-        "🔵 <b>New position</b>",
-        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.margin_usd:g} · плечо x{p.leverage:g}",
-        f"#{symbol} {TF}",
-        f"💎 SIDE: {side}",
+        "🔵 <b>Сигнал SK 0→A→B — точка B</b>",
+        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.entry_usd:g} спот · капитал ${p.capital_usd:g}",
+        f"#{symbol} · {TF} · 🟢 LONG",
         "",
         f"👉 ENTRY: <code>{fmt_px(entry)}</code>",
-        f"🧱 Block: <code>{fmt_px(min(box.top, box.bottom))} – {fmt_px(max(box.top, box.bottom))}</code>",
-        f"🛑 SL: <code>{fmt_px(sl)}</code> (за блок +{p.sl_buffer_pct:g}%)",
+        f"ⓘ Структура: 0 <code>{fmt_px(info['p0'])}</code> → A <code>{fmt_px(info['pA'])}</code>",
+        f"🧱 Зелёный блок (цели от B): {block}",
         "",
-        f"🎯 TP: <code>{fmt_px(tp)}</code> | 💲 {(tp-entry)/entry*100*d:+.2f}% · R/R 1:{rr:.1f}",
-        f"(тейк — ближайший противоположный блок)",
+        f"🎯 TP1: <code>{fmt_px(info['tp1'])}</code> (+{p.tp1_pct:g}%) — закрою {p.tp1_frac * 100:g}%",
+        f"🛑 SL: закрытие ниже B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа ниже 0 (<code>{fmt_px(info['cat_sl'])}</code>)",
         "",
         f"📊 Signals for pair: {pp['signals']}",
-        f"✅ Closed trades: {pp['closed']}",
-        "Prices in USDT. TP %: price movement, without leverage.",
+        "Prices in USDT. Без плеча, чистый спот.",
     ]))
+
+
+def part_pos(symbol, pos, px, frac, label, p):
+    """Частичная фиксация (TP1 +2% / TP2 1.618)."""
+    notional = pos["entry_usd"] * frac
+    pnl_usdt = notional * (px - pos["entry"]) / pos["entry"]
+    pnl_usdt -= _fees(notional, p)
+    pos["left_frac"] = max(pos["left_frac"] - frac, 0.0)
+    pos["tp1_done" if "TP1" in label else "tp2_done"] = True
+    book.balance += pnl_usdt
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    book.daily.setdefault(day, {"n": 0, "pnl": 0.0})
+    book.daily[day]["pnl"] += pnl_usdt
+    book.save()
+    log_event(f"PART {label} #{symbol} @ {fmt_px(px)}")
+    tg_send(NL.join([
+        f"💰 <b>Частичная фиксация — {label}</b>",
+        f"#{symbol} {TF} · 🟢 LONG",
+        f"👉 ENTRY: <code>{fmt_px(pos['entry'])}</code>",
+        f"✂️ Закрыто {frac * 100:g}% (${pos['entry_usd'] * frac:g}) по <code>{fmt_px(px)}</code>",
+        f"💵 PnL: <b>{pnl_usdt:+.2f} USDT</b>",
+        f"🧷 Остаток позиции: {pos['left_frac'] * 100:g}%",
+        f"🏦 Balance: {book.balance:,.2f} USDT",
+    ]), kb=True)
 
 
 def close_pos(symbol, pos, px, reason, p):
     d = pos["dir"]
+    frac = pos.get("left_frac", 1.0)
     ret = (px - pos["entry"]) / pos["entry"] * 100 * d
-    pnl_usdt = pos.get("qty", 0) * (px - pos["entry"]) * d
-    pnl_usdt -= (pos["entry"] + px) * pos.get("qty", 0) * p.fee_pct / 100.0
-    won = ret > 0
+    notional = pos["entry_usd"] * frac
+    pnl_usdt = notional * (px - pos["entry"]) / pos["entry"] * d
+    pnl_usdt -= _fees(notional, p)
+    won = pnl_usdt > 0
     book.balance += pnl_usdt
     pp = book.per_pair.setdefault(symbol, {"signals": 0, "closed": 0, "wins": 0,
                                            "losses": 0, "pnl": 0.0})
@@ -378,21 +430,22 @@ def close_pos(symbol, pos, px, reason, p):
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     book.daily.setdefault(day, {"n": 0, "pnl": 0.0})
     book.daily[day]["n"] += 1
-    book.daily[day]["pnl"] += ret
+    book.daily[day]["pnl"] += pnl_usdt
     total = book.wins + book.losses
-    wr = f"{book.wins/total*100:.0f}%" if total else "—"
-    icon = "✅" if reason == "TP" else ("⏱" if reason == "TIME" else "🛑")
-    title = {"TP": "TAKE-PROFIT (block reached)", "SL": "STOP-LOSS", "TIME": "TIME OUT"}[reason]
+    wr = f"{book.wins / total * 100:.0f}%" if total else "—"
+    icon = "✅" if str(reason).startswith("TP") else ("⏱" if reason == "TIME" else "🛑")
+    title = {"TP3 2.0": "TAKE-PROFIT 2.0 (финал)", "SL": "STOP-LOSS",
+             "TIME": "TIME OUT"}.get(reason, reason)
     dur = max(int(time.time() - pos["opened"]) // 3600, 1)
     book.save()
     del book.open[symbol]
-    log_event(("CLOSE " if reason != "TP" else "TP HIT ") + "#" + symbol + " " + reason + " " + ("%+.2f%%" % ret))
+    log_event(("CLOSE " if not str(reason).startswith("TP") else "TP HIT ") + "#" + symbol + " " + str(reason) + " " + ("%+.2f%%" % ret))
     tg_send(NL.join([
-        f"{icon} <b>Position closed — {title}</b>",
+        f"{icon} <b>Позиция закрыта — {title}</b>",
         f"#{symbol} {TF} · {'🟢 LONG 📈' if d == 1 else '🔴 SHORT 📉'}",
         f"👉 ENTRY: <code>{fmt_px(pos['entry'])}</code>",
         f"🔚 EXIT: <code>{fmt_px(px)}</code> ({ret:+.2f}%)",
-        f"💰 PnL: <b>{ret:+.2f}%</b> ({pnl_usdt:+.2f} USDT · x{p.leverage:g})",
+        f"💰 PnL остатка: <b>{pnl_usdt:+.2f} USDT</b> (закрыто {frac * 100:g}%)",
         f"🕐 Duration: ~{dur} h",
         f"📊 Trades: {book.wins}W / {book.losses}L · winrate {wr} · balance {book.balance:,.2f} USDT",
     ]), kb=True)
@@ -411,21 +464,20 @@ def cmd_status():
     ]
     for sym, p_ in book.open.items():
         age = max(int(time.time() - p_["opened"]) // 3600, 0)
-        side = "LONG" if p_["dir"] == 1 else "SHORT"
-        lines.append(f"   {sym} {side} · entry {fmt_px(p_['entry'])} · age {age}h"
-                     + (" · TP1✓" if p_.get("tp1_done") else "") + (" · TP2✓" if p_.get("tp2_done") else ""))
+        lines.append(f"   {sym} LONG · entry {fmt_px(p_['entry'])} · age {age}h"
+                     + (" · TP1✓" if p_.get("tp1_done") else "") + (" · TP2✓" if p_.get("tp2_done") else "")
+                     + f" · left {p_.get('left_frac', 1) * 100:g}%")
     return NL.join(lines)
 
 
 def cmd_table():
     if not book.open:
         return "📋 No open positions"
-    rows = ["<code>Symbol       Side    Entry          SL             TP1            TP2           Age</code>"]
+    rows = ["<code>Symbol       Entry          TP1(+2%)       SL(close<B)     Left   Age</code>"]
     for sym, p_ in book.open.items():
-        side = "LONG " if p_["dir"] == 1 else "SHORT"
         age = f"{max(int(time.time() - p_['opened']) // 3600, 0)}h"
-        rows.append("<code>" + f"{sym:<12}{side:<7}{fmt_px(p_['entry']):<14}{fmt_px(p_['sl']):<14}"
-                    f"{fmt_px(p_['tp1_px']):<14}{fmt_px(p_['tp2_px']):<13}{age}" + "</code>")
+        rows.append("<code>" + f"{sym:<12}{fmt_px(p_['entry']):<14}{fmt_px(p_['tp1']):<14}"
+                    f"{fmt_px(p_['fail_px']):<15}{p_.get('left_frac', 1) * 100:<5g}%{age}" + "</code>")
     return "📋 <b>Open positions</b>" + NL + NL.join(rows)
 
 
@@ -599,14 +651,32 @@ def write_state():
 
 # ---------------------------------------------------------------- main
 
+def build_universe():
+    """(symbols, exchange). Binance top-200 предпочтительно; если Binance
+    гео-блочит серверный IP (451) — KuCoin: те же монеты и цены."""
+    try:
+        uni = fetch_binance_top_usdt(TOP_N)
+        if uni:
+            return uni, "binance"
+    except Exception as e:
+        log.error("binance universe failed: %s", e)
+    try:
+        uni = fetch_kucoin_top_usdt(TOP_N)
+        if uni:
+            return uni, "kucoin"
+    except Exception as e:
+        log.error("kucoin universe failed: %s", e)
+    return load_universe(TOP_N, os.path.join(DATA, "universe.json")), "binance"
+
+
 def main():
-    log.info("SK System bot start. top_n=%s max_pos=%s demo=%s", TOP_N, MAX_POS, DEMO)
-    ex_map = build_exchange_map(TOP_N)
+    log.info("SK System bot start. top_n=%s max_pos=%s demo=%s tf=%s", TOP_N, MAX_POS, DEMO, TF)
+    uni, ex = build_universe()
+    ex_map = {s: [ex] for s in uni}
     STATE["exch_map"] = ex_map
     STATE["map_ts"] = time.time()
     STATE["universe"] = sorted(ex_map.keys())
-    log.info("universe: %d symbols via %s", len(STATE["universe"]),
-             {ex: sum(1 for v in ex_map.values() if ex in v) for ex in EXCHANGES})
+    log.info("universe: %d symbols via %s (Binance top by 24h volume)", len(STATE["universe"]), ex)
     try:
         probe = fetch_klines("BTCUSDT", TF, limit=2)
         log.info("binance api check OK (%d rows)", len(probe))
@@ -614,10 +684,11 @@ def main():
         log.error("binance api check FAILED: %s", e)
     tg_set_commands()
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
-                     f"├ Universe: top-{len(STATE['universe'])} by market cap",
-                     "├ Timeframe: " + TF + " · scan every " + TF,
-                     "├ Setup: impulse -> zone 0.5-0.786 -> trigger 0.559",
-                     "├ TP1 50% (+2.5%) · TP2 25% (+5%) · runner 25% (trail SL)",
+                     f"├ Universe: Binance top-{len(STATE['universe'])} by 24h volume",
+                     "├ Timeframe: " + TF + " · стратегия 0→A→B (только лонг, спот)",
+                     "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
+                     "├ TP1 +2% на 30% · TP2 1.618 на 30% · TP3 2.0 на 40%",
+                     f"├ Вход ${cfg().entry_usd:g} · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
     threading.Thread(target=command_poller, daemon=True).start()
     threading.Thread(target=webcmd_watcher, daemon=True).start()
@@ -626,23 +697,22 @@ def main():
         STATE["alive"] = {ex for ex in EXCHANGES if ping_exchange(ex)}
         if time.time() - STATE["map_ts"] > 6 * 3600:
             try:
-                ex_map = build_exchange_map(TOP_N)
-                if ex_map:
-                    STATE["exch_map"] = ex_map
-                    STATE["universe"] = sorted(ex_map.keys())
+                uni, ex = build_universe()
+                if uni:
+                    STATE["exch_map"] = {s: [ex] for s in uni}
+                    STATE["universe"] = sorted(STATE["exch_map"].keys())
                     STATE["map_ts"] = time.time()
-                    log.info("exchange map rebuilt: %d symbols", len(ex_map))
+                    log.info("universe rebuilt: %d symbols via %s", len(uni), ex)
             except Exception as e:
-                log.error("map rebuild: %s", e)
+                log.error("universe rebuild: %s", e)
         if STATE["paused"]:
             continue
         p = cfg()
-        p.timeout_bars = int(os.environ.get("TIMEOUT_BARS", str(p.timeout_bars)))
         t0 = time.time()
         for i, symbol in enumerate(STATE["universe"]):
             try:
                 process_symbol(symbol, p)
-                if symbol not in STATE["cache"] and (i + 1) % 10 == 0:
+                if symbol not in STATE["cache"] and (i + 1) % 25 == 0:
                     log.info("warmup %d/%d", i + 1, len(STATE["universe"]))
             except Exception as e:
                 log.exception("scan %s: %s", symbol, e)

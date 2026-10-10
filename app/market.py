@@ -138,6 +138,57 @@ def load_universe(top_n, cache_file):
         return DEFAULT_UNIVERSE.split(",")
 
 
+def fetch_binance_top_usdt(n=200):
+    """Топ-n USDT-спот пар Binance по суточному объёму (без плечевых токенов
+    UP/DOWN и фиатных/стейбл-пар). Для стратегии 0->A->B юзер задал Binance top-200."""
+    skip_bases = {"USDC", "FDUSD", "BUSD", "DAI", "TUSD", "USDP", "EUR", "GBP",
+                  "TRY", "BRL", "AEUR", "EURI", "XUSD", "WUSD", "BFUSD", "USD1"}
+    r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
+                     headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    rows = []
+    for t in r.json():
+        sym = t["symbol"]
+        if not sym.endswith("USDT"):
+            continue
+        base = sym[:-4]
+        if base in skip_bases or base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+            continue
+        try:
+            qv = float(t["quoteVolume"])
+        except (KeyError, ValueError):
+            continue
+        rows.append((sym, qv))
+    rows.sort(key=lambda x: -x[1])
+    return [s for s, _ in rows[:n]]
+
+
+def fetch_kucoin_top_usdt(n=200):
+    """Топ-n USDT-спот пар KuCoin по суточному объёму. Те же монеты и цены,
+    что на Binance (арбитраж держит их совпадающими) — рабочий обход
+    гео-блока Binance (HTTP 451) с серверного IP."""
+    skip_bases = {"USDC", "FDUSD", "BUSD", "DAI", "TUSD", "USDP", "EUR", "GBP",
+                  "TRY", "BRL", "AEUR", "EURI", "XUSD"}
+    r = requests.get("https://api.kucoin.com/api/v1/market/allTickers",
+                     headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    rows = []
+    for t in r.json()["data"]["ticker"]:
+        sym = t.get("symbol") or ""
+        if not sym.endswith("-USDT"):
+            continue
+        base = sym[:-5]
+        if base in skip_bases or base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+            continue
+        try:
+            qv = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+        rows.append((sym.replace("-", ""), qv))
+    rows.sort(key=lambda x: -x[1])
+    return [s for s, _ in rows[:n]]
+
+
 # ---------------------------------------------------- vision archive (bt)
 
 def _vision_df(url):

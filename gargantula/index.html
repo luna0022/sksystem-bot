@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>GARGANTUA — Schwarzschild Black Hole Raytracer</title>
+<style>
+  :root{
+    --hud-fg: rgba(210, 232, 255, 0.92);
+    --hud-dim: rgba(150, 185, 220, 0.55);
+    --hud-line: rgba(140, 190, 255, 0.28);
+    --hud-accent: #ffb45e;
+    --mono: "JetBrains Mono", "SFMono-Regular", "Consolas", "Menlo", monospace;
+  }
+  *{ margin:0; padding:0; box-sizing:border-box; }
+  html,body{ width:100%; height:100%; overflow:hidden; background:#000; font-family:var(--mono); }
+  canvas#gl{ position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; cursor:grab; }
+  canvas#gl.dragging{ cursor:grabbing; }
+
+  /* ---------- HUD ---------- */
+  #hud{ position:fixed; inset:0; pointer-events:none; color:var(--hud-fg); z-index:10;
+        transition: opacity .5s ease; font-size:11px; letter-spacing:.08em; }
+  #hud.hidden{ opacity:0; }
+  .corner{ position:absolute; width:26px; height:26px; border:1px solid var(--hud-line); }
+  .corner.tl{ top:12px; left:12px; border-right:none; border-bottom:none; }
+  .corner.tr{ top:12px; right:12px; border-left:none; border-bottom:none; }
+  .corner.bl{ bottom:12px; left:12px; border-right:none; border-top:none; }
+  .corner.br{ bottom:12px; right:12px; border-left:none; border-top:none; }
+
+  .panel{ position:absolute; pointer-events:auto;
+          background:rgba(4,10,18,.42); backdrop-filter: blur(3px);
+          border:1px solid var(--hud-line); padding:12px 14px; }
+  .panel h2{ font-size:10px; font-weight:600; letter-spacing:.28em; color:var(--hud-dim);
+             margin-bottom:8px; text-transform:uppercase; }
+  .panel h2::before{ content:"▸ "; color:var(--hud-accent); }
+
+  #title-panel{ top:24px; left:24px; max-width:340px; }
+  #title-panel h1{ font-size:22px; letter-spacing:.42em; font-weight:700; color:#fff;
+                   text-shadow:0 0 18px rgba(140,200,255,.55); margin-bottom:4px; }
+  #title-panel .sub{ font-size:10px; color:var(--hud-accent); letter-spacing:.18em; margin-bottom:3px; }
+  #title-panel .tag{ font-size:9px; color:var(--hud-dim); letter-spacing:.14em; }
+  #mission{ margin-top:10px; padding-top:8px; border-top:1px solid var(--hud-line);
+            font-size:10px; color:var(--hud-dim); }
+  #mission b{ color:var(--hud-fg); font-weight:600; }
+
+  #telemetry{ top:24px; right:24px; min-width:230px; }
+  .trow{ display:flex; justify-content:space-between; gap:14px; padding:2px 0; font-size:10px; }
+  .trow .k{ color:var(--hud-dim); }
+  .trow .v{ color:var(--hud-fg); }
+
+  #deck{ bottom:52px; right:24px; width:236px; }
+  .btn-grid{ display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:6px; }
+  button.hbtn{ pointer-events:auto; font-family:var(--mono); font-size:9px; letter-spacing:.16em;
+    color:var(--hud-fg); background:rgba(20,40,66,.35); border:1px solid var(--hud-line);
+    padding:7px 4px; cursor:pointer; text-transform:uppercase; transition: all .18s ease; }
+  button.hbtn:hover{ background:rgba(90,160,255,.22); border-color:rgba(160,210,255,.6); }
+  button.hbtn.active{ background:rgba(255,180,94,.18); border-color:var(--hud-accent); color:var(--hud-accent); }
+  button.hbtn:focus-visible{ outline:1px solid var(--hud-accent); outline-offset:2px; }
+  .wide{ grid-column:1 / -1; }
+
+  #params{ bottom:52px; left:24px; width:260px; max-height:60vh; overflow-y:auto;
+           transform:translateX(-14px); opacity:0; pointer-events:none; transition:all .35s ease; }
+  #params.open{ transform:none; opacity:1; pointer-events:auto; }
+  .slider-row{ margin-bottom:9px; }
+  .slider-row label{ display:flex; justify-content:space-between; font-size:9px;
+                     color:var(--hud-dim); margin-bottom:3px; letter-spacing:.12em; }
+  .slider-row label span:last-child{ color:var(--hud-fg); }
+  input[type=range]{ width:100%; appearance:none; -webkit-appearance:none; height:2px;
+    background:var(--hud-line); outline:none; cursor:pointer; }
+  input[type=range]::-webkit-slider-thumb{ appearance:none; -webkit-appearance:none; width:10px; height:10px;
+    background:var(--hud-accent); border:1px solid #000; }
+  input[type=range]::-moz-range-thumb{ width:10px; height:10px; background:var(--hud-accent); border:1px solid #000; border-radius:0; }
+
+  #hint{ position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+         font-size:9px; color:var(--hud-dim); letter-spacing:.12em; white-space:nowrap; }
+  #navlink{ position:absolute; bottom:6px; right:12px; z-index:25;
+         font-size:9px; letter-spacing:.18em; }
+  #navlink a{ color:var(--hud-dim); text-decoration:none; opacity:.65; transition:opacity .2s; }
+  #navlink a:hover{ opacity:1; color:var(--hud-accent); }
+
+  /* ---------- Toast ---------- */
+  #toast{ position:fixed; top:64px; left:50%; transform:translate(-50%,-12px); z-index:30;
+    font-family:var(--mono); font-size:10px; letter-spacing:.24em; color:var(--hud-accent);
+    background:rgba(6,12,22,.8); border:1px solid var(--hud-line); padding:8px 22px;
+    opacity:0; transition:all .4s ease; pointer-events:none; text-transform:uppercase; }
+  #toast.show{ opacity:1; transform:translate(-50%,0); }
+
+  /* ---------- Intro ---------- */
+  #intro{ position:fixed; inset:0; z-index:40; background:#000; display:flex;
+    align-items:center; justify-content:center; transition:opacity 1.6s ease; }
+  #intro.gone{ opacity:0; pointer-events:none; }
+  #intro .card{ text-align:center; color:var(--hud-fg); border:1px solid var(--hud-line);
+    padding:44px 60px; background:rgba(4,8,16,.5); position:relative; max-width:88vw; }
+  #intro .card::before, #intro .card::after{ content:""; position:absolute; width:18px; height:18px; border:1px solid var(--hud-accent); }
+  #intro .card::before{ top:-1px; left:-1px; border-right:none; border-bottom:none; }
+  #intro .card::after{ bottom:-1px; right:-1px; border-left:none; border-top:none; }
+  #intro .k{ font-size:9px; letter-spacing:.5em; color:var(--hud-dim); margin-bottom:16px; }
+  #intro .n{ font-size:34px; letter-spacing:.5em; font-weight:700; color:#fff;
+             text-shadow:0 0 26px rgba(150,200,255,.7); margin-bottom:16px; padding-left:.5em; }
+  #intro .q{ font-size:11px; font-style:italic; color:var(--hud-dim); letter-spacing:.1em; }
+  #intro .load{ margin-top:22px; font-size:9px; letter-spacing:.3em; color:var(--hud-accent); animation:blink 1.2s infinite; }
+  @keyframes blink{ 50%{ opacity:.25; } }
+
+  /* ---------- Error ---------- */
+  #fatal{ position:fixed; inset:0; z-index:50; background:#02040a; display:none;
+    align-items:center; justify-content:center; color:var(--hud-fg); }
+  #fatal.show{ display:flex; }
+  #fatal .card{ text-align:center; border:1px solid rgba(255,90,90,.4); padding:40px 56px; }
+  #fatal h1{ color:#ff6b6b; letter-spacing:.4em; font-size:22px; margin-bottom:12px; }
+  #fatal p{ font-size:10px; color:var(--hud-dim); margin-bottom:20px; letter-spacing:.12em; }
+
+  @media (max-width:760px){
+    #title-panel{ top:12px; left:12px; padding:8px 10px; }
+    #title-panel h1{ font-size:15px; }
+    #telemetry{ top:auto; bottom:12px; left:12px; right:auto; min-width:0; padding:8px 10px; }
+    #deck{ bottom:12px; right:12px; width:200px; padding:8px 10px; }
+    #params{ bottom:12px; left:12px; width:210px; max-height:48vh; }
+    #hint{ display:none; }
+    .corner{ display:none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="gl" aria-label="Real-time raytraced Schwarzschild black hole"></canvas>
+
+<div id="hud" role="region" aria-label="Mission HUD">
+  <div class="corner tl"></div><div class="corner tr"></div>
+  <div class="corner bl"></div><div class="corner br"></div>
+
+  <div class="panel" id="title-panel">
+    <h1>GARGANTUA</h1>
+    <div class="sub">SUPERMASSIVE BLACK HOLE · 1.0 × 10⁸ M☉</div>
+    <div class="tag">SCHWARZSCHILD METRIC // NULL-GEODESIC RAYTRACING</div>
+    <div id="mission">MISSION ELAPSED <b id="mission-time">T+ 00:00:00</b></div>
+  </div>
+
+  <div class="panel" id="telemetry" aria-live="off">
+    <h2>Telemetry</h2>
+    <div class="trow"><span class="k">OBSERVER DISTANCE</span><span class="v" id="t-dist">—</span></div>
+    <div class="trow"><span class="k">DISK INCLINATION</span><span class="v" id="t-incl">—</span></div>
+    <div class="trow"><span class="k">GEODESIC STEPS</span><span class="v" id="t-steps">—</span></div>
+    <div class="trow"><span class="k">RENDER PROFILE</span><span class="v" id="t-prof">—</span></div>
+    <div class="trow"><span class="k">FRAME RATE</span><span class="v" id="t-fps">—</span></div>
+  </div>
+
+  <div class="panel" id="deck" role="group" aria-label="Cinematic sequence controls">
+    <h2>Cinematic Sequence</h2>
+    <div class="btn-grid">
+      <button class="hbtn wide" id="btn-cine" aria-pressed="false">Cinematic · Off</button>
+      <button class="hbtn" data-preset="poster">Poster</button>
+      <button class="hbtn" data-preset="edge">Edge</button>
+      <button class="hbtn" data-preset="polar">Polar</button>
+      <button class="hbtn" data-preset="close">Close</button>
+      <button class="hbtn" id="btn-auto" aria-pressed="true">Auto · On</button>
+      <button class="hbtn" id="btn-quality" aria-pressed="true">Cinematic Q</button>
+      <button class="hbtn" id="btn-params" aria-expanded="false">Params</button>
+      <button class="hbtn" id="btn-hud" aria-pressed="true">HUD · On</button>
+      <button class="hbtn wide" id="btn-sound" aria-pressed="false">Sound · Off</button>
+    </div>
+  </div>
+
+  <div class="panel" id="params" role="group" aria-label="Render parameters">
+    <h2>Parameters</h2>
+    <div id="sliders"></div>
+    <div class="btn-grid"><button class="hbtn wide" id="btn-reset">Reset Defaults</button></div>
+  </div>
+
+  <div id="hint">[1–4] PRESETS · [C] CINEMATIC · [R] AUTO-ORBIT · [P] PARAMS · [M] SOUND · [H] HUD · DRAG ORBIT · WHEEL ZOOM</div>
+  <div id="navlink"><a href="terminal.html" title="GMT://TERMINAL">ТОРГОВЫЙ ТЕРМИНАЛ →</a></div>
+</div>
+
+<div id="toast" role="status"></div>
+
+<div id="intro">
+  <div class="card">
+    <div class="k">REAL-TIME RELATIVISTIC RAYTRACING</div>
+    <div class="n">GARGANTUA</div>
+    <div class="q">“Do not go gentle into that good night.”</div>
+    <div class="load" id="intro-load">INITIALISING GEODESIC INTEGRATOR…</div>
+  </div>
+</div>
+
+<div id="fatal">
+  <div class="card">
+    <h1>SIGNAL LOST</h1>
+    <p id="fatal-msg">WEBGL2 CONTEXT UNAVAILABLE — RAYTRACER OFFLINE</p>
+    <div class="btn-grid" style="display:flex; gap:8px; justify-content:center;">
+      <button class="hbtn" id="btn-reinit">Reinitialise</button>
+      <button class="hbtn" id="btn-lowq">Lower Quality</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* Shader sources (top-level consts shared with the main script below) */
+const VERT = `#version 300 es
+void main(){
+  vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2));
+  gl_Position = vec4(p*2.0-1.0, 0.0, 1.0);
+}`;
+
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 O;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uCamPos;
+uniform vec3  uRight, uUp, uFwd;
+uniform float uFov;        // tan(fov/2)
+uniform int   uSteps;
+uniform float uBright;     // disk brightness
+uniform float uTemp;       // disk temperature/tint multiplier
+uniform float uExposure;
+uniform float uBloom;
+uniform float uStarDens;
+uniform float uCosI, uSinI; // disk inclination
+
+const float RS = 1.0;      // Schwarzschild radius (scene units)
+const float DISK_IN = 2.35, DISK_OUT = 9.0;
+
+float hash13(vec3 p){ p = fract(p*0.1031); p += dot(p, p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+vec3  hash33(vec3 p){ p = fract(p*vec3(0.1031,0.1030,0.0973)); p += dot(p, p.yxz+33.33); return fract((p.xxy+p.yxx)*p.zyx); }
+
+float vnoise(vec3 p){
+  vec3 i = floor(p), f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  float n000=hash13(i), n100=hash13(i+vec3(1,0,0)), n010=hash13(i+vec3(0,1,0)), n110=hash13(i+vec3(1,1,0));
+  float n001=hash13(i+vec3(0,0,1)), n101=hash13(i+vec3(1,0,1)), n011=hash13(i+vec3(0,1,1)), n111=hash13(i+vec3(1,1,1));
+  return mix(mix(mix(n000,n100,f.x), mix(n010,n110,f.x), f.y),
+             mix(mix(n001,n101,f.x), mix(n011,n111,f.x), f.y), f.z);
+}
+float fbm(vec3 p){
+  float v=0.0, a=0.5;
+  for(int i=0;i<4;i++){ v += a*vnoise(p); p = p*2.13 + vec3(7.7); a *= 0.5; }
+  return v;
+}
+
+// black-body-ish palette: white-hot inner -> yellow -> orange -> deep red
+vec3 diskPalette(float t){
+  t = clamp(t, 0.0, 1.0) * uTemp;
+  vec3 c = mix(vec3(0.55,0.12,0.02), vec3(1.0,0.42,0.08), smoothstep(0.0,0.45,t));
+  c = mix(c, vec3(1.0,0.80,0.38), smoothstep(0.35,0.72,t));
+  c = mix(c, vec3(1.05,1.00,0.92), smoothstep(0.65,1.0,t));
+  return c;
+}
+
+vec3 starField(vec3 d){
+  vec3 col = vec3(0.0);
+  // faint nebula
+  float neb = fbm(d*2.6 + vec3(3.1));
+  col += vec3(0.10,0.13,0.22) * pow(neb, 3.2) * 0.8;
+  col += vec3(0.16,0.08,0.05) * pow(fbm(d*1.7 - vec3(9.0)), 4.0) * 0.6;
+  // two layers of procedural stars
+  for(int L=0; L<2; L++){
+    float sc = (L==0) ? 42.0 : 90.0;
+    vec3 q = d * sc * uStarDens;
+    vec3 id = floor(q);
+    vec3 rnd = hash33(id);
+    vec3 sp = id + 0.15 + rnd*0.7;
+    float dist = length(q - sp);
+    float bright = pow(rnd.z, 14.0) * 30.0;
+    float star = bright * exp(-dist*dist*28.0);
+    vec3 tint = mix(vec3(0.75,0.85,1.0), vec3(1.0,0.85,0.7), rnd.x);
+    col += star * tint * step(0.15, uStarDens);
+  }
+  return col;
+}
+
+vec3 aces(vec3 x){
+  return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
+  vec3 ro = uCamPos;
+  vec3 rd = normalize(uFwd + uFov*(uv.x*uRight + uv.y*uUp));
+
+  // disk plane (rotated about X axis by inclination)
+  vec3 dn = vec3(0.0, uCosI, uSinI);
+
+  vec3 p = ro;
+  vec3 v = rd;
+  vec3 col = vec3(0.0);
+  float trans = 1.0;
+  float rmin = 1e9;
+  float glow = 0.0;
+  bool captured = false;
+  float prevSide = dot(p - vec3(0.0), dn);
+
+  for(int i=0;i<260;i++){
+    if(i >= uSteps) break;
+    float r = length(p);
+    rmin = min(rmin, r);
+    if(r < RS){ captured = true; break; }
+    if(r > 55.0) break;
+
+    // adaptive step: fine near hole, coarse far away
+    float dt = clamp(0.35*r - 0.25, 0.045, 0.9);
+
+    // qualitative null geodesic: d2x/dt2 = -1.5 h^2 x / r^5  (h = |x cross v|)
+    vec3 h = cross(p, v);
+    float h2 = dot(h, h);
+    vec3 acc = -1.5 * h2 * p / pow(r, 5.0);
+    v = normalize(v + acc * dt);
+    vec3 np = p + v * dt;
+
+    // accumulated relativistic glow near the hole (feeds photon ring + bloom)
+    glow += uBloom * 0.0011 * dt / max(pow(r - 0.9, 2.0), 1e-4) * smoothstep(5.0, 1.6, r);
+
+    // disk crossing?
+    float side = dot(np, dn);
+    if(side * prevSide < 0.0 && trans > 0.01){
+      float f = prevSide / (prevSide - side);
+      vec3 hit = mix(p, np, f);
+      float hr = length(hit);
+      if(hr > DISK_IN && hr < DISK_OUT){
+        float rn = (hr - DISK_IN) / (DISK_OUT - DISK_IN);
+        // turbulence in rotating disk frame
+        float ang = atan(hit.z, hit.x) + uTime * (0.55 / (0.35 + rn*2.2));
+        vec2 pol = vec2(ang * 3.0, hr * 1.15);
+        float turb = fbm(vec3(pol, uTime*0.05)) ;
+        float bands = 0.65 + 0.7 * fbm(vec3(pol*2.4, 1.7));
+        float temp = pow(1.0 - rn, 1.5);
+        float density = smoothstep(0.0, 0.05, rn) * smoothstep(1.0, 0.5, rn);
+        density *= (0.25 + 1.3*turb) * bands;
+        density = pow(clamp(density, 0.0, 1.5), 1.4);
+        // doppler beaming: tangential velocity, approaching side brighter/bluer
+        vec3 tang = normalize(cross(dn, hit));
+        float dop = dot(v, tang);
+        float beta = 0.55 / sqrt(max(hr - 1.2, 0.3));
+        float beam = pow(clamp(1.0 + dop*beta, 0.25, 2.6), 3.0);
+        float shift = clamp(1.0 + dop*beta*0.55, 0.6, 1.8);
+        vec3 dcol = diskPalette(temp * shift) * uBright * beam;
+        float alpha = clamp(density * 0.6, 0.0, 0.92);
+        col += trans * alpha * dcol;
+        trans *= (1.0 - alpha);
+      }
+    }
+    prevSide = side;
+    p = np;
+  }
+
+  if(!captured){
+    col += trans * starField(normalize(v));
+    // photon ring highlight (min approach near 1.5 Rs)
+    float ring = exp(-pow((rmin - 1.55)*11.0, 2.0));
+    col += ring * vec3(1.0, 0.85, 0.6) * (0.7 + 0.5*uBloom);
+    // inner glow / bloom halo
+    col += glow * vec3(1.0, 0.62, 0.30);
+    col += exp(-max(rmin - 1.0, 0.0)*2.2) * uBloom * 0.12 * vec3(1.0, 0.55, 0.22);
+  }
+
+  // tone map, vignette, grain
+  col = aces(col * uExposure);
+  vec2 sv = gl_FragCoord.xy / uRes;
+  col *= 0.35 + 0.65 * pow(16.0*sv.x*sv.y*(1.0-sv.x)*(1.0-sv.y), 0.28);
+  float gr = (hash13(vec3(gl_FragCoord.xy, fract(uTime)*371.0)) - 0.5) * 0.028;
+  col += gr;
+  O = vec4(col, 1.0);
+}`;
+</script>
+<script>
+"use strict";
+(function(){
+const $ = id => document.getElementById(id);
+const canvas = $("gl");
+const toastEl = $("toast");
+let toastTimer = 0;
+function toast(msg){
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>toastEl.classList.remove("show"), 1800);
+}
+
+/* ---------------- state ---------------- */
+const DEF = {
+  dist: 17.0, yaw: 0.6, pitch: 0.34, incl: 0.0,
+  bright: 1.15, temp: 1.0, exposure: 1.0, bloom: 1.0,
+  steps: 160, starDens: 1.0, scale: 0.6
+};
+const S = Object.assign({}, DEF);       // live params (uniform-bound)
+const cam = { yaw: DEF.yaw, pitch: DEF.pitch, dist: DEF.dist,
+              vyaw: 0, vpitch: 0, vdist: 0,
+              tyaw: DEF.yaw, tpitch: DEF.pitch, tdist: DEF.dist };
+let autoOrbit = true, cinematic = false, highQuality = true, hudOn = true;
+let qualityScale = DEF.scale, autoDegraded = false;
+let gl = null, prog = null, U = {};
+const startT = performance.now();
+let lastT = startT, fpsEMA = 60, lowFpsT = 0, simT = 0;
+// URL overrides for testing / embedding: ?q=0.3&steps=80
+const qs = new URLSearchParams(location.search);
+if(qs.has("q")) qualityScale = Math.max(0.15, Math.min(1, parseFloat(qs.get("q")) || DEF.scale));
+if(qs.has("steps")) S.steps = Math.max(16, parseInt(qs.get("steps"), 10) || DEF.steps);
+
+/* ---------------- GL init ---------------- */
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s) || "shader compile failed");
+  return s;
+}
+function initGL(){
+  gl = canvas.getContext("webgl2", { antialias:false, alpha:false, depth:false, powerPreference:"high-performance" });
+  if(!gl) throw new Error("WebGL2 unavailable");
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog) || "link failed");
+  gl.useProgram(prog);
+  ["uRes","uTime","uCamPos","uRight","uUp","uFwd","uFov","uSteps","uBright",
+   "uTemp","uExposure","uBloom","uStarDens","uCosI","uSinI"].forEach(n=>{
+    U[n] = gl.getUniformLocation(prog, n);
+  });
+  $("fatal").classList.remove("show");
+}
+function fatal(msg){
+  $("fatal-msg").textContent = msg;
+  $("fatal").classList.add("show");
+}
+try { initGL(); } catch(e){ fatal(String(e.message||e).toUpperCase()); }
+$("btn-reinit").addEventListener("click", ()=>{ try{ initGL(); toast("SIGNAL RESTORED"); }catch(e){ fatal(String(e.message||e).toUpperCase()); } });
+$("btn-lowq").addEventListener("click", ()=>{
+  qualityScale = 0.35; highQuality = false; S.steps = 90;
+  try{ initGL(); toast("LOW QUALITY MODE"); }catch(e){ fatal(String(e.message||e).toUpperCase()); }
+});
+canvas.addEventListener("webglcontextlost", e=>{ e.preventDefault(); fatal("CONTEXT LOST — GPU SIGNAL INTERRUPTED"); });
+
+/* ---------------- resize ---------------- */
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(2, Math.round(canvas.clientWidth  * dpr * qualityScale));
+  const h = Math.max(2, Math.round(canvas.clientHeight * dpr * qualityScale));
+  if(canvas.width !== w || canvas.height !== h){
+    canvas.width = w; canvas.height = h;
+    if(gl) gl.viewport(0, 0, w, h);
+  }
+}
+window.addEventListener("resize", resize);
+
+/* ---------------- camera control ---------------- */
+const PRESETS = {
+  poster: { yaw: 0.65, pitch: 0.32, dist: 15.0 },
+  edge:   { yaw: 2.40, pitch: 0.05, dist: 10.0 },
+  polar:  { yaw: 4.20, pitch: 1.25, dist: 16.0 },
+  close:  { yaw: 5.40, pitch: 0.42, dist: 5.2 }
+};
+function flyTo(p){
+  cam.tyaw = p.yaw; cam.tpitch = p.pitch; cam.tdist = p.dist;
+  cam.vyaw = cam.vpitch = cam.vdist = 0;
+}
+let dragging = false, lastX = 0, lastY = 0, pinchD = 0;
+const pointers = new Map();
+canvas.addEventListener("pointerdown", e=>{
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  canvas.classList.add("dragging");
+  if(cinematic) setCinematic(false);
+});
+canvas.addEventListener("pointermove", e=>{
+  if(!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if(pointers.size === 2){
+    const pts = [...pointers.values()];
+    const d = Math.hypot(pts[0][0]-pts[1][0], pts[0][1]-pts[1][1]);
+    if(pinchD > 0){
+      cam.tdist = clampD(cam.tdist * pinchD / d);
+      cam.dist = clampD(cam.dist * pinchD / d);
+    }
+    pinchD = d;
+    return;
+  }
+  if(!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  cam.vyaw = -dx * 0.0035; cam.vpitch = -dy * 0.0035;
+  cam.yaw += cam.vyaw; cam.pitch = clampP(cam.pitch + cam.vpitch);
+  cam.tyaw = cam.yaw; cam.tpitch = cam.pitch;
+});
+function endPointer(e){
+  pointers.delete(e.pointerId);
+  if(pointers.size < 2) pinchD = 0;
+  if(pointers.size === 0){ dragging = false; canvas.classList.remove("dragging"); }
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("wheel", e=>{
+  e.preventDefault();
+  cam.vdist += e.deltaY * 0.004;
+}, { passive:false });
+function clampP(p){ return Math.max(-1.45, Math.min(1.45, p)); }
+function clampD(d){ return Math.max(3.4, Math.min(40, d)); }
+
+/* ---------------- sound (procedural WebAudio drone) ---------------- */
+let actx = null, master = null, soundOn = false;
+function buildAudio(){
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  master = actx.createGain(); master.gain.value = 0; master.connect(actx.destination);
+  const filt = actx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = 220; filt.Q.value = 4; filt.connect(master);
+  [[38,"sine",.5],[57.2,"sine",.28],[76.4,"triangle",.12],[114.6,"sine",.08]].forEach(([f,t,g])=>{
+    const o = actx.createOscillator(); o.type = t; o.frequency.value = f;
+    const gn = actx.createGain(); gn.gain.value = g;
+    o.connect(gn); gn.connect(filt); o.start();
+  });
+  // slow shimmer LFO
+  const lfo = actx.createOscillator(); lfo.frequency.value = 0.07;
+  const lg = actx.createGain(); lg.gain.value = 90;
+  lfo.connect(lg); lg.connect(filt.frequency); lfo.start();
+  // filtered noise wash
+  const len = actx.sampleRate * 2, buf = actx.createBuffer(1, len, actx.sampleRate);
+  const ch = buf.getChannelData(0);
+  for(let i=0;i<len;i++) ch[i] = (Math.random()*2-1) * 0.25;
+  const ns = actx.createBufferSource(); ns.buffer = buf; ns.loop = true;
+  const nf = actx.createBiquadFilter(); nf.type = "bandpass"; nf.frequency.value = 320; nf.Q.value = 0.6;
+  const ng = actx.createGain(); ng.gain.value = 0.05;
+  ns.connect(nf); nf.connect(ng); ng.connect(master); ns.start();
+}
+function setSound(on){
+  soundOn = on;
+  if(on && !actx) buildAudio();
+  if(actx){
+    if(actx.state === "suspended") actx.resume();
+    master.gain.cancelScheduledValues(actx.currentTime);
+    master.gain.linearRampToValueAtTime(on ? 0.16 : 0, actx.currentTime + 1.2);
+  }
+  $("btn-sound").textContent = "Sound · " + (on ? "On" : "Off");
+  $("btn-sound").setAttribute("aria-pressed", on);
+  toast("SOUND " + (on ? "ENGAGED" : "MUTED"));
+}
+
+/* ---------------- UI bindings ---------------- */
+function setCinematic(on){
+  cinematic = on;
+  $("btn-cine").textContent = "Cinematic · " + (on ? "On" : "Off");
+  $("btn-cine").setAttribute("aria-pressed", on);
+  toast("CINEMATIC SEQUENCE " + (on ? "ENGAGED" : "STANDBY"));
+}
+function setAuto(on){
+  autoOrbit = on;
+  $("btn-auto").textContent = "Auto · " + (on ? "On" : "Off");
+  $("btn-auto").setAttribute("aria-pressed", on);
+  toast("AUTO-ORBIT " + (on ? "ON" : "OFF"));
+}
+function setQuality(hi){
+  highQuality = hi; autoDegraded = false;
+  qualityScale = hi ? Math.max(DEF.scale, 0.6) : 0.38;
+  S.steps = hi ? 180 : 90;
+  syncSlider("steps"); resize();
+  $("btn-quality").textContent = hi ? "Cinematic Q" : "Performance Q";
+  $("btn-quality").setAttribute("aria-pressed", hi);
+  toast("RENDER PROFILE: " + (hi ? "CINEMATIC" : "PERFORMANCE"));
+}
+function setHUD(on){
+  hudOn = on;
+  $("hud").classList.toggle("hidden", !on);
+  $("btn-hud").textContent = "HUD · " + (on ? "On" : "Off");
+  $("btn-hud").setAttribute("aria-pressed", on);
+}
+$("btn-cine").addEventListener("click", ()=>setCinematic(!cinematic));
+$("btn-auto").addEventListener("click", ()=>setAuto(!autoOrbit));
+$("btn-quality").addEventListener("click", ()=>setQuality(!highQuality));
+$("btn-hud").addEventListener("click", ()=>setHUD(!hudOn));
+$("btn-sound").addEventListener("click", ()=>setSound(!soundOn));
+$("btn-params").addEventListener("click", ()=>{
+  const p = $("params"), open = !p.classList.contains("open");
+  p.classList.toggle("open", open);
+  $("btn-params").setAttribute("aria-expanded", open);
+});
+document.querySelectorAll("[data-preset]").forEach(b=>{
+  b.addEventListener("click", ()=>{
+    flyTo(PRESETS[b.dataset.preset]);
+    toast("CAMERA: " + b.dataset.preset.toUpperCase());
+  });
+});
+window.addEventListener("keydown", e=>{
+  if(e.target && /INPUT|TEXTAREA/.test(e.target.tagName)) return;
+  const k = e.key.toLowerCase();
+  if(k >= "1" && k <= "4"){
+    const names = ["poster","edge","polar","close"];
+    flyTo(PRESETS[names[+k-1]]); toast("CAMERA: " + names[+k-1].toUpperCase());
+  }
+  else if(k === "c") setCinematic(!cinematic);
+  else if(k === "r") setAuto(!autoOrbit);
+  else if(k === "p") $("btn-params").click();
+  else if(k === "m") setSound(!soundOn);
+  else if(k === "h") setHUD(!hudOn);
+});
+
+/* ---------------- params sliders ---------------- */
+const SLIDERS = [
+  ["dist",     "OBSERVER DISTANCE", 3.4, 40, 0.1,  v=>v.toFixed(1)+" Rs"],
+  ["incl",     "DISK INCLINATION", -1.2, 1.2, 0.01, v=>(v*57.2958).toFixed(0)+"°"],
+  ["bright",   "DISK BRIGHTNESS",  0.1, 3.0, 0.01, v=>v.toFixed(2)],
+  ["temp",     "DISK TEMPERATURE", 0.4, 1.6, 0.01, v=>v.toFixed(2)],
+  ["exposure", "EXPOSURE",         0.2, 2.5, 0.01, v=>v.toFixed(2)],
+  ["bloom",    "BLOOM INTENSITY",  0.0, 3.0, 0.01, v=>v.toFixed(2)],
+  ["steps",    "GEODESIC STEPS",   48, 260, 1,    v=>String(v|0)],
+  ["starDens", "STAR DENSITY",     0.15, 2.5, 0.01, v=>v.toFixed(2)]
+];
+const sliderEls = {};
+(function buildSliders(){
+  const host = $("sliders");
+  SLIDERS.forEach(([key,label,min,max,step,fmt])=>{
+    const row = document.createElement("div");
+    row.className = "slider-row";
+    const lab = document.createElement("label");
+    lab.innerHTML = "<span>"+label+"</span><span id='val-"+key+"'></span>";
+    const inp = document.createElement("input");
+    inp.type = "range"; inp.min = min; inp.max = max; inp.step = step;
+    inp.value = S[key]; inp.id = "sl-"+key;
+    inp.setAttribute("aria-label", label);
+    inp.addEventListener("input", ()=>{
+      S[key] = parseFloat(inp.value);
+      if(key === "steps") S.steps = S.steps|0;
+      if(key === "dist"){ cam.dist = cam.tdist = clampD(S.dist); }
+      $("val-"+key).textContent = fmt(S[key]);
+    });
+    row.appendChild(lab); row.appendChild(inp); host.appendChild(row);
+    sliderEls[key] = { inp, fmt };
+  });
+})();
+function syncSlider(key){
+  const s = sliderEls[key]; if(!s) return;
+  s.inp.value = S[key];
+  $("val-"+key).textContent = s.fmt(S[key]);
+}
+function syncAllSliders(){ SLIDERS.forEach(([k])=>syncSlider(k)); }
+syncAllSliders();
+$("btn-reset").addEventListener("click", ()=>{
+  Object.assign(S, DEF);
+  S.scale = qualityScale; // keep current quality scale
+  flyTo({ yaw: DEF.yaw, pitch: DEF.pitch, dist: DEF.dist });
+  syncAllSliders();
+  toast("PARAMETERS RESET");
+});
+
+/* ---------------- telemetry ---------------- */
+function fmtTime(ms){
+  const s = Math.floor(ms/1000);
+  const p = n => String(n).padStart(2, "0");
+  return "T+ " + p(Math.floor(s/3600)) + ":" + p(Math.floor(s/60)%60) + ":" + p(s%60);
+}
+let telemT = 0;
+function telemetry(now, dt){
+  if(now - telemT < 200) return;
+  telemT = now;
+  $("mission-time").textContent = fmtTime(now - startT);
+  $("t-dist").textContent = cam.dist.toFixed(2) + " Rs";
+  $("t-incl").textContent = (S.incl*57.2958).toFixed(1) + "° / cam " + (cam.pitch*57.2958).toFixed(0) + "°";
+  $("t-steps").textContent = S.steps + " / px";
+  $("t-prof").textContent = (highQuality ? "CINEMATIC" : "PERFORMANCE") + (autoDegraded ? " ↓AUTO" : "") + " @" + Math.round(qualityScale*100) + "%";
+  $("t-fps").textContent = fpsEMA.toFixed(0) + " FPS";
+}
+
+/* ---------------- render loop ---------------- */
+function render(now){
+  requestAnimationFrame(render);
+  const dt = Math.min((now - lastT)/1000, 0.1);
+  lastT = now; simT += dt;
+  if(dt > 0) fpsEMA = fpsEMA*0.95 + (1/dt)*0.05;
+
+  // auto quality degradation
+  if(!autoDegraded && fpsEMA < 24){ lowFpsT += dt; } else lowFpsT = 0;
+  if(lowFpsT > 3){
+    autoDegraded = true;
+    qualityScale = Math.max(qualityScale*0.7, 0.3);
+    S.steps = Math.max(S.steps - 40, 70); syncSlider("steps");
+    resize(); toast("AUTO-DEGRADE: QUALITY REDUCED");
+  }
+
+  // camera dynamics
+  if(cinematic){
+    const t = simT * 0.12;
+    cam.tyaw   = t * 1.2;
+    cam.tpitch = 0.45 + 0.55 * Math.sin(t * 0.7);
+    cam.tdist  = 11 + 6.5 * Math.sin(t * 0.43 + 1.3);
+  } else if(autoOrbit && !dragging){
+    cam.tyaw += dt * 0.06;
+  }
+  // inertia + smoothing toward targets
+  cam.vyaw *= 0.93; cam.vpitch *= 0.93; cam.vdist *= 0.88;
+  if(!dragging){
+    cam.yaw += cam.vyaw; cam.pitch = clampP(cam.pitch + cam.vpitch);
+    cam.dist = clampD(cam.dist + cam.vdist); cam.tdist = cam.dist;
+  }
+  const k = 1 - Math.exp(-dt*3.2);
+  cam.yaw   += (cam.tyaw - cam.yaw) * k;
+  cam.pitch += (clampP(cam.tpitch) - cam.pitch) * k;
+  cam.dist  += (clampD(cam.tdist) - cam.dist) * k;
+  S.dist = cam.dist;
+  if(sliderEls.dist && document.activeElement !== sliderEls.dist.inp) syncSlider("dist");
+
+  if(!gl || !prog){ telemetry(now, dt); return; }
+  resize();
+
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const cy = Math.cos(cam.yaw),   sy = Math.sin(cam.yaw);
+  const pos = [cam.dist*cp*sy, cam.dist*sp, cam.dist*cp*cy];
+  const fwd = norm3([-pos[0], -pos[1], -pos[2]]);
+  const right = norm3(cross3(fwd, [0,1,0]));
+  const up = cross3(right, fwd);
+
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, simT);
+  gl.uniform3f(U.uCamPos, pos[0], pos[1], pos[2]);
+  gl.uniform3f(U.uRight, right[0], right[1], right[2]);
+  gl.uniform3f(U.uUp, up[0], up[1], up[2]);
+  gl.uniform3f(U.uFwd, fwd[0], fwd[1], fwd[2]);
+  gl.uniform1f(U.uFov, 0.55);
+  gl.uniform1i(U.uSteps, S.steps|0);
+  gl.uniform1f(U.uBright, S.bright);
+  gl.uniform1f(U.uTemp, S.temp);
+  gl.uniform1f(U.uExposure, S.exposure);
+  gl.uniform1f(U.uBloom, S.bloom);
+  gl.uniform1f(U.uStarDens, S.starDens);
+  gl.uniform1f(U.uCosI, Math.cos(S.incl));
+  gl.uniform1f(U.uSinI, Math.sin(S.incl));
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  telemetry(now, dt);
+}
+function cross3(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function norm3(a){ const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; }
+
+/* ---------------- intro ---------------- */
+resize();
+requestAnimationFrame(render);
+setTimeout(()=>{ $("intro-load").textContent = "LOCK ACQUIRED"; }, 1400);
+setTimeout(()=>{
+  $("intro").classList.add("gone");
+  setTimeout(()=>$("intro").remove(), 1800);
+}, 2600);
+})();
+</script>
+</body>
+</html>

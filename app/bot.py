@@ -299,7 +299,9 @@ def load_symbol(symbol):
 
 def process_symbol(symbol, p):
     cache = STATE["cache"]
-    if symbol not in cache:
+    # инициализируем трекер, если его нет (новая монета или сброс через reset:
+    # reset чистит trackers/processed, но cache остаётся)
+    if symbol not in STATE["trackers"]:
         df0 = load_symbol(symbol)
         cache[symbol] = df0
         tr = SKTracker(p)
@@ -326,12 +328,12 @@ def process_symbol(symbol, p):
               .sort_values("open_time").tail(WARMUP_BARS).reset_index(drop=True))
         cache[symbol] = df
     last_closed = len(df) - 2
-    if last_closed <= STATE["processed"][symbol]:
+    if last_closed <= STATE["processed"].get(symbol, -1):
         return
     hv, lv = df["high"].values, df["low"].values
     ov, cv = df["open"].values, df["close"].values
     tr = STATE["trackers"][symbol]
-    for i in range(STATE["processed"][symbol] + 1, last_closed + 1):
+    for i in range(STATE["processed"].get(symbol, 0) + 1, last_closed + 1):
         for ev in tr.update(hv, lv, ov, cv, i):
             if ev[0] == "sig":
                 _, entry, info = ev

@@ -137,6 +137,21 @@ def test_no_signal_without_impulse():
     assert not [e for e in ev if e[0] == "sig"]
 
 
+def test_replay_mode_no_positions():
+    """armed=False: детектор строит состояние по истории, но не открывает позицию."""
+    p = SParams()
+    bars = base_uptrend_setup()
+    h = np.array([b[1] for b in bars]); l = np.array([b[2] for b in bars])
+    o = np.array([b[0] for b in bars]); c = np.array([b[3] for b in bars])
+    tr = SKTracker(p)
+    tr.armed = False
+    events = []
+    for i in range(len(bars)):
+        events.extend(tr.update(h, l, o, c, i))
+    assert not [e for e in events if e[0] == "sig"]
+    assert tr.pos is None
+
+
 def test_fuzz_random_walk_no_crash():
     rng = np.random.default_rng(42)
     for _ in range(5):

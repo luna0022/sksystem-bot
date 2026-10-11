@@ -302,9 +302,20 @@ def load_symbol(symbol):
 def process_symbol(symbol, p):
     cache = STATE["cache"]
     if symbol not in cache:
-        cache[symbol] = load_symbol(symbol)
-        STATE["processed"][symbol] = len(cache[symbol]) - 2
-        STATE["trackers"][symbol] = SKTracker(p)
+        df0 = load_symbol(symbol)
+        cache[symbol] = df0
+        tr = SKTracker(p)
+        if not df0.empty:
+            # прокручиваем тёплые бары: детектор сразу видит структуры
+            # 0->A->B, уже находящиеся в работе (позиции не открываем)
+            tr.armed = False
+            hv, lv = df0["high"].values, df0["low"].values
+            ov, cv = df0["open"].values, df0["close"].values
+            for i in range(len(df0) - 1):
+                tr.update(hv, lv, ov, cv, i)
+            tr.armed = True
+        STATE["trackers"][symbol] = tr
+        STATE["processed"][symbol] = len(df0) - 2
         return
     df = cache[symbol]
     ex = STATE["exch"].get(symbol) or "binance"

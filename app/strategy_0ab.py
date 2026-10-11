@@ -78,6 +78,8 @@ class SKTracker:
         self.act_bar = None
         self.seq_done = False     # с точки 0 отработали TP1 — можно новую 0 выше
         self.sig_sent = False     # сигнал по текущей паре (t0, tA) уже был
+        self.armed = True         # False во время прогона истории — детектор
+                                  # строит состояние, но позиции не открывает
         # --- позиция ---
         self.pos = None
 
@@ -148,8 +150,9 @@ class SKTracker:
             self.sig_sent = False
 
         # --- СИГНАЛ: касание зоны B (вход по закрытию) ---
-        if (p.entry_mode == "zone" and self.state == 2 and self.pos is None
-                and not self.sig_sent and self.pA is not None):
+        if (p.entry_mode == "zone" and self.armed and self.state == 2
+                and self.pos is None and not self.sig_sent
+                and self.pA is not None):
             z_top, z_bot = self._zone()
             if lo <= z_top and cl > self.p0:
                 entry = cl
@@ -170,7 +173,8 @@ class SKTracker:
             self.state = 4
             self.act_bar = i
             events.append(("act",))
-            if (p.entry_mode == "act" and self.pos is None and not self.sig_sent):
+            if (p.entry_mode == "act" and self.armed and self.pos is None
+                    and not self.sig_sent):
                 entry = cl
                 lv = self._levels_from(self.pB)
                 self.pos = {

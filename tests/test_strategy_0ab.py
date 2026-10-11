@@ -92,13 +92,13 @@ def test_full_setup_tp1_tp2_tp3():
     assert lv[1.618] == pytest.approx(104 + 1.618 * 30, abs=0.5)
     # после подтверждения пивота B=100 уровни обновятся до 148.5/160 —
     # это проверяем косвенно по ценам исполнения TP2/TP3 ниже
-    # порядок частичных фиксаций
+    # порядок: TP1 на 30%, затем 1.618 закрывает 100% позиции
     parts = [(e[3], e[2]) for e in ev if e[0] == "part"]
+    assert len(parts) == 1
     assert parts[0][0].startswith("TP1") and parts[0][1] == pytest.approx(0.30)
-    assert parts[1][0].startswith("TP2") and parts[1][1] == pytest.approx(0.30)
     exits = [e for e in ev if e[0] == "exit"]
-    assert len(exits) == 1 and exits[0][2] == "TP3 2.0"
-    assert exits[0][1] == pytest.approx(160.0, abs=0.5)
+    assert len(exits) == 1 and exits[0][2] == "TP2 1.618"
+    assert exits[0][1] == pytest.approx(148.5, abs=0.5)   # уровень после подтверждения B=100
 
 
 def test_stop_loss_on_fail_close_below_b():

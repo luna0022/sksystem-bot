@@ -21,8 +21,7 @@
 Money management (правила юзера, спот):
  - вход $100 с капитала $1000 (до 10 позиций, следит bot.py)
  - TP1: +2%  -> закрыть 30%
- - TP2: уровень 1.618 от B -> закрыть 30%
- - TP3: уровень 2.000 от B -> закрыть остаток 40%
+ - TP2: уровень 1.618 от B -> закрыть 100% позиции (остаток 70%)
  - SL: закрытие ниже B (провал сетапа), аварийный стоп чуть ниже точки 0
  - тайм-аут позиции: life_active свечей с момента входа
 
@@ -54,8 +53,7 @@ class SParams:
     capital_usd: float = 1000.0
     tp1_pct: float = 2.0            # TP1: +2% ...
     tp1_frac: float = 0.30          # ... на 30% позиции
-    tp2_frac: float = 0.30          # 30% на уровне 1.618
-    tp3_frac: float = 0.40          # остаток 40% на уровне 2.000
+    # дальше всё: TP2 = уровень 1.618 закрывает 100% позиции
     sl_buffer_pct: float = 0.2      # аварийный стоп ниже точки 0, %
     fee_pct: float = 0.1            # спот Binance, обе стороны
 
@@ -277,7 +275,7 @@ class SKTracker:
             events.append(("exit", cl, "TIME"))
             self._finish(i)
             return events
-        # тейки (по high, исполнение по уровню; консервативно SL раньше — выше)
+        # тейки: TP1 +2% на 30%, далее 1.618 закрывает 100% позиции
         if not pos["tp1_done"] and hi >= pos["tp1"]:
             pos["tp1_done"] = True
             pos["left_frac"] -= p.tp1_frac
@@ -285,12 +283,8 @@ class SKTracker:
             self.seq_done = True
             if self.state == 4:
                 self.state = 0
-        if not pos["tp2_done"] and pos["lv"] and hi >= pos["lv"][0][1]:
-            pos["tp2_done"] = True
-            pos["left_frac"] -= p.tp2_frac
-            events.append(("part", pos["lv"][0][1], p.tp2_frac, "TP2 1.618"))
-        if pos["lv"] and hi >= pos["lv"][-1][1]:
-            events.append(("exit", pos["lv"][-1][1], "TP3 2.0"))
+        if pos["lv"] and hi >= pos["lv"][0][1]:
+            events.append(("exit", pos["lv"][0][1], "TP2 1.618"))
             self._finish(i)
             return events
         return events

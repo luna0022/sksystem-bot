@@ -63,8 +63,6 @@ def cfg() -> SParams:
         capital_usd=float(os.environ.get("CAPITAL_USD", "1000")),
         tp1_pct=float(os.environ.get("TP1_PCT", "2.0")),
         tp1_frac=float(os.environ.get("TP1_FRAC", "0.30")),
-        tp2_frac=float(os.environ.get("TP2_FRAC", "0.30")),
-        tp3_frac=float(os.environ.get("TP3_FRAC", "0.40")),
         entry_mode=os.environ.get("ENTRY_MODE", "zone"),
         min_impulse_atr=float(os.environ.get("MIN_IMPULSE_ATR", "1.5")),
         zone_min=float(os.environ.get("ZONE_MIN", "0.5")),
@@ -226,7 +224,7 @@ def make_chart(symbol, df, pos):
         sp.set_color("#30363d")
     ax.set_xlim(xmin, xmax)
     ax.grid(color="#21262d", lw=0.5)
-    fig.text(0.01, 0.01, "SK System | 0→A→B | сигнал в точке B | TP1 +2%/30% · 1.618/30% · 2.0/40% | SL: закрытие<B",
+    fig.text(0.01, 0.01, "SK System | 0→A→B | сигнал в точке B | TP1 +2%/30% · TP2 1.618 = 100% | SL: закрытие<B",
              color="#8b949e", fontsize=7)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
@@ -382,6 +380,7 @@ def open_pos(symbol, entry, info, df, p):
         f"🧱 Зелёный блок (цели от B): {block}",
         "",
         f"🎯 TP1: <code>{fmt_px(info['tp1'])}</code> (+{p.tp1_pct:g}%) — закрою {p.tp1_frac * 100:g}%",
+        f"🎯 TP2: уровень 1.618 — закрою 100% позиции",
         f"🛑 SL: закрытие ниже B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа ниже 0 (<code>{fmt_px(info['cat_sl'])}</code>)",
         "",
         f"📊 Signals for pair: {pp['signals']}",
@@ -445,7 +444,7 @@ def close_pos(symbol, pos, px, reason, p):
     total = book.wins + book.losses
     wr = f"{book.wins / total * 100:.0f}%" if total else "—"
     icon = "✅" if str(reason).startswith("TP") else ("⏱" if reason == "TIME" else "🛑")
-    title = {"TP3 2.0": "TAKE-PROFIT 2.0 (финал)", "SL": "STOP-LOSS",
+    title = {"TP2 1.618": "TAKE-PROFIT 1.618 (финал, 100%)", "SL": "STOP-LOSS",
              "TIME": "TIME OUT"}.get(reason, reason)
     dur = max(int(time.time() - pos["opened"]) // 3600, 1)
     book.save()
@@ -698,7 +697,7 @@ def main():
                      f"├ Universe: Binance top-{len(STATE['universe'])} by 24h volume",
                      "├ Timeframe: " + TF + " · стратегия 0→A→B (только лонг, спот)",
                      "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
-                     "├ TP1 +2% на 30% · TP2 1.618 на 30% · TP3 2.0 на 40%",
+                     "├ TP1 +2% на 30% · TP2 (1.618) закрывает 100%",
                      f"├ Вход ${cfg().entry_usd:g} · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
     threading.Thread(target=command_poller, daemon=True).start()

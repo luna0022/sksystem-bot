@@ -44,6 +44,10 @@ SECONDS = {"1h": 3600, "4h": 14400}
 TOP_N = int(os.environ.get("TOP_N", "200"))
 MAX_POS = int(os.environ.get("MAX_POSITIONS", "10"))
 DEMO = os.environ.get("DEMO", "true").lower() == "true"
+LEVERAGE = float(os.environ.get("LEVERAGE", "1"))
+# с плечом>1: не берём сетапы, где стоп дальше MAX_STOP_PCT% от входа
+# (иначе ликвидация наступит раньше стопа: у 3x маржа сгорает при ~-30% цены)
+MAX_STOP_PCT = float(os.environ.get("MAX_STOP_PCT", "8"))
 WARMUP_BARS = 400
 
 NL = chr(10)
@@ -339,6 +343,12 @@ def process_symbol(symbol, p):
                 _, entry, info = ev
                 if STATE["paused"] or len(book.open) >= MAX_POS or symbol in book.open:
                     continue
+                if LEVERAGE > 1 and info.get("fail_px"):
+                    stop_pct = (entry - info["fail_px"]) / entry * 100
+                    if stop_pct > MAX_STOP_PCT:
+                        log.info("skip %s: stop %.1f%% > max %.1f%% (leverage %gx)",
+                                 symbol, stop_pct, MAX_STOP_PCT, LEVERAGE)
+                        continue
                 open_pos(symbol, entry, info, df, p)
             elif ev[0] == "part" and symbol in book.open:
                 _, px, frac, label = ev
@@ -374,7 +384,7 @@ def open_pos(symbol, entry, info, df, p):
                        for lv, px in pos["lv"])
     tg_photo(make_chart(symbol, df, pos), NL.join([
         "🔵 <b>Сигнал SK 0→A→B — точка B</b>",
-        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.entry_usd:g} спот · капитал ${p.capital_usd:g}",
+        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.entry_usd:g} · плечо {LEVERAGE:g}x (номинал ${p.entry_usd * LEVERAGE:g}) · капитал ${p.capital_usd:g}",
         f"#{symbol} · {TF} · 🟢 LONG",
         "",
         f"👉 ENTRY: <code>{fmt_px(entry)}</code>",
@@ -386,13 +396,13 @@ def open_pos(symbol, entry, info, df, p):
         f"🛑 SL: закрытие ниже B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа ниже 0 (<code>{fmt_px(info['cat_sl'])}</code>)",
         "",
         f"📊 Signals for pair: {pp['signals']}",
-        "Prices in USDT. Без плеча, чистый спот.",
+        f"Prices in USDT. Плечо {LEVERAGE:g}x — PnL считается на маржу, движение цены x{LEVERAGE:g}.",
     ]))
 
 
 def part_pos(symbol, pos, px, frac, label, p):
     """Частичная фиксация (TP1 +2% / TP2 1.618)."""
-    notional = pos["entry_usd"] * frac
+    notional = pos["entry_usd"] * frac * LEVERAGE
     pnl_usdt = notional * (px - pos["entry"]) / pos["entry"]
     pnl_usdt -= _fees(notional, p)
     pos["left_frac"] = max(pos["left_frac"] - frac, 0.0)
@@ -418,7 +428,7 @@ def close_pos(symbol, pos, px, reason, p):
     d = pos["dir"]
     frac = pos.get("left_frac", 1.0)
     ret = (px - pos["entry"]) / pos["entry"] * 100 * d
-    notional = pos["entry_usd"] * frac
+    notional = pos["entry_usd"] * frac * LEVERAGE
     pnl_usdt = notional * (px - pos["entry"]) / pos["entry"] * d
     pnl_usdt -= _fees(notional, p)
     won = pnl_usdt > 0
@@ -697,10 +707,10 @@ def main():
     tg_set_commands()
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
                      f"├ Universe: Binance top-{len(STATE['universe'])} by 24h volume",
-                     "├ Timeframe: " + TF + " · стратегия 0→A→B (только лонг, спот)",
+                     "├ Timeframe: " + TF + " · стратегия 0→A→B (только лонг)",
                      "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
                      "├ TP1 +2% на 30% · TP2 (1.618) закрывает 100%",
-                     f"├ Вход ${cfg().entry_usd:g} · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
+                     f"├ Вход ${cfg().entry_usd:g} · плечо {LEVERAGE:g}x · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
     threading.Thread(target=command_poller, daemon=True).start()
     threading.Thread(target=webcmd_watcher, daemon=True).start()

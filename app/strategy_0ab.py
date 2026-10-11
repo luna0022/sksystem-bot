@@ -56,6 +56,9 @@ class SParams:
     # дальше всё: TP2 = уровень 1.618 закрывает 100% позиции
     sl_buffer_pct: float = 0.2      # аварийный стоп ниже точки 0, %
     fee_pct: float = 0.1            # спот Binance, обе стороны
+    # --- ручной метод хозяина: слоистый сбор + безубыток + повторные входы ---
+    be_after_tp1: bool = True       # после TP1 стоп в безубыток (цена входа)
+    reentries: int = 3              # повторных входов при возврате в зону B
 
 
 class SKTracker:
@@ -76,6 +79,9 @@ class SKTracker:
         self.act_bar = None
         self.seq_done = False     # с точки 0 отработали TP1 — можно новую 0 выше
         self.sig_sent = False     # сигнал по текущей паре (t0, tA) уже был
+        self.reentry_count = 0    # сколько повторных входов отработали
+        self._last_exit_be = False  # последний выход был в безубыток (можно входить снова)
+        self._last_exit_i = -1
         self.armed = True         # False во время прогона истории — детектор
                                   # строит состояние, но позиции не открывает
         # --- позиция ---
@@ -166,6 +172,29 @@ class SKTracker:
                 self.sig_sent = True
                 events.append(("sig", entry, dict(self.pos)))
 
+        # --- ПОВТОРНЫЙ ВХОД: цена вернулась в зону B после выхода в безубыток ---
+        # (ручной метод хозяина: забрали 30% на отскоке, остаток вышел в БУ,
+        # цена снова в точке B (0.5) — входим снова, глубже, от ~0.618)
+        if (p.reentries > 0 and self.armed and self.pos is None
+                and self._last_exit_be and i > self._last_exit_i
+                and self.reentry_count < p.reentries
+                and self.pA is not None and self.p0 is not None
+                and cl > self.p0):
+            z_top, z_bot = self._zone()
+            if lo <= z_top:
+                entry = cl
+                pB_eff = min(max(lo, z_bot), z_top)
+                lv = self._levels_from(pB_eff)
+                self.pos = {
+                    "entry": entry, "opened_i": i, "p0": self.p0, "pA": self.pA,
+                    "pB": pB_eff, "fail_px": pB_eff, "cat_sl": self.p0 * (1 - p.sl_buffer_pct / 100),
+                    "tp1": entry * (1 + p.tp1_pct / 100),
+                    "lv": lv, "tp1_done": False, "tp2_done": False,
+                    "left_frac": 1.0, "reentry": self.reentry_count + 1,
+                }
+                self.reentry_count += 1
+                events.append(("sig", entry, dict(self.pos)))
+
         # --- активация: закрытие выше A ---
         if self.state == 3 and self.pA is not None and cl > self.pA:
             self.state = 4
@@ -197,6 +226,8 @@ class SKTracker:
                     self.state = 1
                     self.sig_sent = False
                     self.seq_done = False
+                    self.reentry_count = 0
+                    self._last_exit_be = False
             elif self.state == 2:
                 rng = self.pA - self.p0
                 r = (self.pA - pL) / rng if rng > 0 else 0
@@ -263,17 +294,17 @@ class SKTracker:
         # катастрофа: ушли за точку 0 (стоп-рынок)
         if lo <= pos["cat_sl"]:
             events.append(("exit", pos["cat_sl"], "SL"))
-            self._finish(i)
+            self._finish(i, "SL")
             return events
         # провал: закрытие ниже B
         if cl < pos["fail_px"]:
             events.append(("exit", cl, "SL"))
-            self._finish(i)
+            self._finish(i, "SL")
             return events
         # тайм-аут
         if i - pos["opened_i"] > p.life_active:
             events.append(("exit", cl, "TIME"))
-            self._finish(i)
+            self._finish(i, "TIME")
             return events
         # тейки: TP1 +2% на 30%, далее 1.618 закрывает 100% позиции
         if not pos["tp1_done"] and hi >= pos["tp1"]:
@@ -285,9 +316,16 @@ class SKTracker:
                 self.state = 0
         if pos["lv"] and hi >= pos["lv"][0][1]:
             events.append(("exit", pos["lv"][0][1], "TP2 1.618"))
-            self._finish(i)
+            self._finish(i, "TP2")
+            return events
+        # безубыток: после TP1 остаток закрываем по цене входа
+        if p.be_after_tp1 and pos["tp1_done"] and cl <= entry:
+            events.append(("exit", entry, "BE"))
+            self._finish(i, "BE")
             return events
         return events
 
-    def _finish(self, i):
+    def _finish(self, i, reason=None):
+        self._last_exit_be = (reason == "BE")
+        self._last_exit_i = i
         self.pos = None

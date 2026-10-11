@@ -77,7 +77,8 @@ def base_uptrend_setup():
 
 
 def test_full_setup_tp1_tp2_tp3():
-    p = SParams()
+    # legacy-режим (без БУ и повторных входов) — базовая механика 0->A->B
+    p = SParams(be_after_tp1=False, reentries=0)
     ev = run(p, base_uptrend_setup())
     sigs = [e for e in ev if e[0] == "sig"]
     assert len(sigs) == 1, f"ожидался 1 сигнал, получено {len(sigs)}: {ev}"
@@ -110,7 +111,7 @@ def test_stop_loss_on_fail_close_below_b():
     for i in range(40):
         px -= 1.2
         tail.append((px + 1.0, px + 1.2, px, px + 0.1))
-    ev = run(SParams(), bars[:27] + tail)
+    ev = run(SParams(be_after_tp1=False, reentries=0), bars[:27] + tail)
     exits = [e for e in ev if e[0] == "exit"]
     assert exits and exits[0][2] == "SL"
     assert exits[0][1] < 96.5   # вышли по провалу (закрытие ниже ~96.4), не по катастрофе 89.8
@@ -169,3 +170,33 @@ def test_fuzz_random_walk_no_crash():
                     assert tr.pos is None or tr.pos["left_frac"] >= 0
         if tr.pos is not None:
             assert 0 <= tr.pos["left_frac"] <= 1
+
+
+def test_be_and_reentry_method():
+    """Метод хозяина: TP1 -> стоп в безубыток -> выход BE -> повторный вход."""
+    p = SParams()          # дефолт: be_after_tp1=True, reentries=3
+    ev = run(p, base_uptrend_setup())
+    kinds = [(e[0], e[2] if e[0] == "exit" else (e[3] if e[0] == "part" else None))
+             for e in ev]
+    # ожидаемая цепочка: sig -> part TP1 -> exit BE -> sig (reentry) -> ...
+    seq = [k for k in kinds if k[0] in ("sig", "part", "exit")]
+    assert seq[0][0] == "sig"
+    assert seq[1] == ("part", "TP1 +2%")
+    assert seq[2] == ("exit", "BE")
+    assert seq[3][0] == "sig"
+    sigs = [e for e in ev if e[0] == "sig"]
+    assert sigs[1][2].get("reentry") == 1
+
+
+def test_no_reentry_after_sl():
+    """После настоящего SL повторный вход не предлагается."""
+    p = SParams(be_after_tp1=False, reentries=3)
+    bars = base_uptrend_setup()
+    tail = []
+    px = 102.0
+    for i in range(40):
+        px -= 1.2
+        tail.append((px + 1.0, px + 1.2, px, px + 0.1))
+    ev = run(p, bars[:27] + tail)
+    sigs = [e for e in ev if e[0] == "sig"]
+    assert len(sigs) == 1   # только первый вход, re-entry не было

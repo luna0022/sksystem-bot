@@ -26,7 +26,7 @@ import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.strategy_0ab import SParams, SKTracker
+from app.strategy_0ab import SParams, SKTracker, invert_event
 from app.market import (fetch_klines, fetch_history, load_universe, build_exchange_map,
                         fetch_klines_ex, ping_exchange, EXCHANGES,
                         fetch_binance_top_usdt, fetch_kucoin_top_usdt)
@@ -45,6 +45,9 @@ TOP_N = int(os.environ.get("TOP_N", "200"))
 MAX_POS = int(os.environ.get("MAX_POSITIONS", "10"))
 DEMO = os.environ.get("DEMO", "true").lower() == "true"
 LEVERAGE = float(os.environ.get("LEVERAGE", "1"))
+# плечо по направлениям: лонг — спот 1x, шорт — фьючерсы, максимум 2x
+LONG_LEVERAGE = float(os.environ.get("LONG_LEVERAGE", os.environ.get("LEVERAGE", "1")))
+SHORT_LEVERAGE = float(os.environ.get("SHORT_LEVERAGE", "2"))
 # с плечом>1: не берём сетапы, где стоп дальше MAX_STOP_PCT% от входа
 # (иначе ликвидация наступит раньше стопа: у 3x маржа сгорает при ~-30% цены)
 MAX_STOP_PCT = float(os.environ.get("MAX_STOP_PCT", "8"))
@@ -211,9 +214,10 @@ def make_chart(symbol, df, pos):
                     color="#7ee0bb", fontsize=7, va="center", ha="right",
                     bbox=dict(boxstyle="round,pad=0.2", fc="#0d1117", ec="#2ea87e", lw=0.5))
     xmin, xmax = -1, len(d)
+    _lng = pos.get("dir", 1) == 1
     rows = [(pos["entry"], "#ffd54a", "ENTRY", "--"),
             (pos["tp1"], up, "TP1 +2%", "-"),
-            (pos["fail_px"], dn, "SL (close<B)", "-"),
+            (pos["fail_px"], dn, "SL (close<B)" if _lng else "SL (close>B)", "-"),
             (pos["cat_sl"], "#b04a4a", "SL catastr (0)", ":")]
     for y, c_, name, st in rows:
         pct = (y - pos["entry"]) / pos["entry"] * 100
@@ -221,7 +225,7 @@ def make_chart(symbol, df, pos):
         ax.text(xmax - 0.5, y, f"{name}  {fmt_px(y)}  ({pct:+.1f}%)", color=c_,
                 fontsize=8, va="center", ha="right",
                 bbox=dict(boxstyle="round,pad=0.25", fc="#0d1117", ec=c_, lw=0.6))
-    ax.set_title(f"#{symbol} · {TF} · LONG · SK 0→A→B", color="#e6edf3",
+    ax.set_title(f"#{symbol} · {TF} · {'LONG' if pos.get('dir', 1) == 1 else 'SHORT'} · SK 0→A→B", color="#e6edf3",
                  fontsize=10, loc="left")
     ax.tick_params(colors="#8b949e", labelsize=7)
     for sp in ax.spines.values():
@@ -308,17 +312,20 @@ def process_symbol(symbol, p):
     if symbol not in STATE["trackers"]:
         df0 = load_symbol(symbol)
         cache[symbol] = df0
-        tr = SKTracker(p)
+        tr_l, tr_s = SKTracker(p), SKTracker(p)
         if not df0.empty:
             # прокручиваем тёплые бары: детектор сразу видит структуры
-            # 0->A->B, уже находящиеся в работе (позиции не открываем)
-            tr.armed = False
+            # 0->A->B, уже находящиеся в работе (позиции не открываем).
+            # Шорт-трекер крутим в инвертированном пространстве цен
+            # (-high/-low/...): падения становятся ростом, шорт = зеркальный лонг.
+            tr_l.armed = tr_s.armed = False
             hv, lv = df0["high"].values, df0["low"].values
             ov, cv = df0["open"].values, df0["close"].values
             for i in range(len(df0) - 1):
-                tr.update(hv, lv, ov, cv, i)
-            tr.armed = True
-        STATE["trackers"][symbol] = tr
+                tr_l.update(hv, lv, ov, cv, i)
+                tr_s.update(-lv, -hv, -ov, -cv, i)
+            tr_l.armed = tr_s.armed = True
+        STATE["trackers"][symbol] = (tr_l, tr_s)
         STATE["processed"][symbol] = len(df0) - 2
         return
     df = cache[symbol]
@@ -336,26 +343,39 @@ def process_symbol(symbol, p):
         return
     hv, lv = df["high"].values, df["low"].values
     ov, cv = df["open"].values, df["close"].values
-    tr = STATE["trackers"][symbol]
+    tr_l, tr_s = STATE["trackers"][symbol]
+
+    def handle(ev, d, lev):
+        if ev[0] == "sig":
+            _, entry, info = ev
+            if STATE["paused"] or len(book.open) >= MAX_POS or symbol in book.open:
+                return
+            if lev > 1 and info.get("fail_px"):
+                stop_pct = abs(entry - info["fail_px"]) / entry * 100
+                if stop_pct > MAX_STOP_PCT:
+                    log.info("skip %s %s: stop %.1f%% > max %.1f%% (leverage %gx)",
+                             symbol, "LONG" if d == 1 else "SHORT",
+                             stop_pct, MAX_STOP_PCT, lev)
+                    return
+            open_pos(symbol, d, entry, info, df, p, lev)
+        elif ev[0] == "part" and symbol in book.open:
+            pos = book.open[symbol]
+            if pos["dir"] != d:
+                return
+            _, px, frac, label = ev
+            part_pos(symbol, pos, float(px), float(frac), label, p)
+        elif ev[0] == "exit" and symbol in book.open:
+            pos = book.open[symbol]
+            if pos["dir"] != d:
+                return
+            _, px, reason = ev
+            close_pos(symbol, pos, float(px), reason, p)
+
     for i in range(STATE["processed"].get(symbol, 0) + 1, last_closed + 1):
-        for ev in tr.update(hv, lv, ov, cv, i):
-            if ev[0] == "sig":
-                _, entry, info = ev
-                if STATE["paused"] or len(book.open) >= MAX_POS or symbol in book.open:
-                    continue
-                if LEVERAGE > 1 and info.get("fail_px"):
-                    stop_pct = (entry - info["fail_px"]) / entry * 100
-                    if stop_pct > MAX_STOP_PCT:
-                        log.info("skip %s: stop %.1f%% > max %.1f%% (leverage %gx)",
-                                 symbol, stop_pct, MAX_STOP_PCT, LEVERAGE)
-                        continue
-                open_pos(symbol, entry, info, df, p)
-            elif ev[0] == "part" and symbol in book.open:
-                _, px, frac, label = ev
-                part_pos(symbol, book.open[symbol], float(px), float(frac), label, p)
-            elif ev[0] == "exit" and symbol in book.open:
-                _, px, reason = ev
-                close_pos(symbol, book.open[symbol], float(px), reason, p)
+        for ev in tr_l.update(hv, lv, ov, cv, i):
+            handle(ev, 1, LONG_LEVERAGE)
+        for ev in tr_s.update(-lv, -hv, -ov, -cv, i):
+            handle(invert_event(ev), -1, SHORT_LEVERAGE)
     STATE["processed"][symbol] = last_closed
 
 
@@ -363,8 +383,8 @@ def _fees(notional, p):
     return notional * p.fee_pct / 100.0 * 2   # вход + выход
 
 
-def open_pos(symbol, entry, info, df, p):
-    pos = {"dir": 1, "entry": entry, "opened": time.time(),
+def open_pos(symbol, d, entry, info, df, p, lev):
+    pos = {"dir": d, "entry": entry, "opened": time.time(), "lev": lev,
            "p0": info["p0"], "pA": info["pA"], "pB": info["pB"],
            "fail_px": info["fail_px"], "cat_sl": info["cat_sl"],
            "tp1": info["tp1"], "lv": [(lv, px) for lv, px in info["lv"]],
@@ -378,32 +398,39 @@ def open_pos(symbol, entry, info, df, p):
     pp["signals"] += 1
     book.open[symbol] = pos
     book.save()
-    log.info("signal %s entry=%s p0=%s pA=%s", symbol, entry, info["p0"], info["pA"])
-    log_event("OPEN LONG #" + symbol + " @ " + fmt_px(entry))
+    log.info("signal %s %s entry=%s p0=%s pA=%s", symbol,
+             "LONG" if d == 1 else "SHORT", entry, info["p0"], info["pA"])
+    log_event(f"OPEN {'LONG' if d == 1 else 'SHORT'} #{symbol} @ {fmt_px(entry)}")
     block = " · ".join(f"{lv} → {fmt_px(px)} ({(px - entry) / entry * 100:+.1f}%)"
                        for lv, px in pos["lv"])
+    dir_txt = "🟢 LONG" if d == 1 else "🔴 SHORT (фьючерсы)"
+    sl_txt = (f"🛑 SL: закрытие ниже B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа ниже 0 (<code>{fmt_px(info['cat_sl'])}</code>)"
+              if d == 1 else
+              f"🛑 SL: закрытие выше B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа выше 0 (<code>{fmt_px(info['cat_sl'])}</code>)")
     tg_photo(make_chart(symbol, df, pos), NL.join([
         "🔵 <b>Сигнал SK 0→A→B — точка B</b>",
-        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.entry_usd:g} · плечо {LEVERAGE:g}x (номинал ${p.entry_usd * LEVERAGE:g}) · капитал ${p.capital_usd:g}",
-        f"#{symbol} · {TF} · 🟢 LONG",
+        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.entry_usd:g} · плечо {lev:g}x (номинал ${p.entry_usd * lev:g}) · капитал ${p.capital_usd:g}",
+        f"#{symbol} · {TF} · {dir_txt}",
         "",
         f"👉 ENTRY: <code>{fmt_px(entry)}</code>",
         f"ⓘ Структура: 0 <code>{fmt_px(info['p0'])}</code> → A <code>{fmt_px(info['pA'])}</code>",
         f"🧱 Зелёный блок (цели от B): {block}",
         "",
-        f"🎯 TP1: <code>{fmt_px(info['tp1'])}</code> (+{p.tp1_pct:g}%) — закрою {p.tp1_frac * 100:g}%",
+        f"🎯 TP1: <code>{fmt_px(info['tp1'])}</code> ({'+' if d == 1 else '−'}{p.tp1_pct:g}%) — закрою {p.tp1_frac * 100:g}%",
         f"🎯 TP2: уровень 1.618 — закрою 100% позиции",
-        f"🛑 SL: закрытие ниже B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа ниже 0 (<code>{fmt_px(info['cat_sl'])}</code>)",
+        sl_txt,
         "",
         f"📊 Signals for pair: {pp['signals']}",
-        f"Prices in USDT. Плечо {LEVERAGE:g}x — PnL считается на маржу, движение цены x{LEVERAGE:g}.",
+        f"Prices in USDT. Плечо {lev:g}x — PnL считается на маржу, движение цены x{lev:g}.",
     ]))
 
 
 def part_pos(symbol, pos, px, frac, label, p):
     """Частичная фиксация (TP1 +2% / TP2 1.618)."""
-    notional = pos["entry_usd"] * frac * LEVERAGE
-    pnl_usdt = notional * (px - pos["entry"]) / pos["entry"]
+    d = pos["dir"]
+    lev = pos.get("lev", 1.0)
+    notional = pos["entry_usd"] * frac * lev
+    pnl_usdt = notional * (px - pos["entry"]) / pos["entry"] * d
     pnl_usdt -= _fees(notional, p)
     pos["left_frac"] = max(pos["left_frac"] - frac, 0.0)
     pos["tp1_done" if "TP1" in label else "tp2_done"] = True
@@ -415,7 +442,7 @@ def part_pos(symbol, pos, px, frac, label, p):
     log_event(f"PART {label} #{symbol} @ {fmt_px(px)}")
     tg_send(NL.join([
         f"💰 <b>Частичная фиксация — {label}</b>",
-        f"#{symbol} {TF} · 🟢 LONG",
+        f"#{symbol} {TF} · {'🟢 LONG 📈' if d == 1 else '🔴 SHORT 📉'}",
         f"👉 ENTRY: <code>{fmt_px(pos['entry'])}</code>",
         f"✂️ Закрыто {frac * 100:g}% (${pos['entry_usd'] * frac:g}) по <code>{fmt_px(px)}</code>",
         f"💵 PnL: <b>{pnl_usdt:+.2f} USDT</b>",
@@ -426,9 +453,10 @@ def part_pos(symbol, pos, px, frac, label, p):
 
 def close_pos(symbol, pos, px, reason, p):
     d = pos["dir"]
+    lev = pos.get("lev", 1.0)
     frac = pos.get("left_frac", 1.0)
     ret = (px - pos["entry"]) / pos["entry"] * 100 * d
-    notional = pos["entry_usd"] * frac * LEVERAGE
+    notional = pos["entry_usd"] * frac * lev
     pnl_usdt = notional * (px - pos["entry"]) / pos["entry"] * d
     pnl_usdt -= _fees(notional, p)
     won = pnl_usdt > 0
@@ -457,7 +485,7 @@ def close_pos(symbol, pos, px, reason, p):
     wr = f"{book.wins / total * 100:.0f}%" if total else "—"
     icon = "✅" if str(reason).startswith("TP") else ("⏱" if reason == "TIME" else "🛑")
     title = {"TP2 1.618": "TAKE-PROFIT 1.618 (финал, 100%)", "SL": "STOP-LOSS",
-             "TIME": "TIME OUT"}.get(reason, reason)
+             "TIME": "TIME OUT", "BE": "БЕЗУБЫТОК"}.get(reason, reason)
     dur = max(int(time.time() - pos["opened"]) // 3600, 1)
     book.save()
     del book.open[symbol]
@@ -486,7 +514,7 @@ def cmd_status():
     ]
     for sym, p_ in book.open.items():
         age = max(int(time.time() - p_["opened"]) // 3600, 0)
-        lines.append(f"   {sym} LONG · entry {fmt_px(p_['entry'])} · age {age}h"
+        lines.append(f"   {sym} {'LONG' if p_['dir'] == 1 else 'SHORT'} · entry {fmt_px(p_['entry'])} · age {age}h"
                      + (" · TP1✓" if p_.get("tp1_done") else "") + (" · TP2✓" if p_.get("tp2_done") else "")
                      + f" · left {p_.get('left_frac', 1) * 100:g}%")
     return NL.join(lines)
@@ -707,10 +735,10 @@ def main():
     tg_set_commands()
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
                      f"├ Universe: Binance top-{len(STATE['universe'])} by 24h volume",
-                     "├ Timeframe: " + TF + " · стратегия 0→A→B (только лонг)",
+                     "├ Timeframe: " + TF + " · стратегия 0→A→B (лонг 1x спот + шорт 2x фьючерсы)",
                      "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
                      "├ TP1 +2% на 30% · TP2 (1.618) закрывает 100%",
-                     f"├ Вход ${cfg().entry_usd:g} · плечо {LEVERAGE:g}x · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
+                     f"├ Вход ${cfg().entry_usd:g} · плечо {LONG_LEVERAGE:g}x лонг / {SHORT_LEVERAGE:g}x шорт · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
     threading.Thread(target=command_poller, daemon=True).start()
     threading.Thread(target=webcmd_watcher, daemon=True).start()

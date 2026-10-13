@@ -45,8 +45,8 @@ TOP_N = int(os.environ.get("TOP_N", "200"))
 MAX_POS = int(os.environ.get("MAX_POSITIONS", "10"))
 DEMO = os.environ.get("DEMO", "true").lower() == "true"
 LEVERAGE = float(os.environ.get("LEVERAGE", "1"))
-# плечо по направлениям: лонг — спот 1x, шорт — фьючерсы, максимум 2x
-LONG_LEVERAGE = float(os.environ.get("LONG_LEVERAGE", os.environ.get("LEVERAGE", "1")))
+# плечо по направлениям: лонг и шорт — фьючерсы, 2x (максимум)
+LONG_LEVERAGE = float(os.environ.get("LONG_LEVERAGE", os.environ.get("LEVERAGE", "2")))
 SHORT_LEVERAGE = float(os.environ.get("SHORT_LEVERAGE", "2"))
 # с плечом>1: не берём сетапы, где стоп дальше MAX_STOP_PCT% от входа
 # (иначе ликвидация наступит раньше стопа: у 3x маржа сгорает при ~-30% цены)

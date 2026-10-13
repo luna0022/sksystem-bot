@@ -4,8 +4,9 @@
 
 Universe: топ-N по капитализации (CoinGecko), пересечённый с USDT-парами KuCoin.
 Timeframe: 4ч (переключается кнопками 15m/1h/4h/1d). MacdTracker: MACD(12,26,9),
-покупка лота $300 на каждой подтверждённой нижней точке MACD (<0), макс. 6 лотов,
-продажа ВСЕГО на высокой точке MACD (>0). Плеча нет — ликвидаций не существует.
+покупка лота $300 на пересечении ВВЕРХ линии MACD через сигнальную, пока MACD < 0
+(макс. 6 лотов), продажа ВСЕГО на пересечении ВНИЗ, пока MACD > 0.
+Плеча нет — ликвидаций не существует.
 Web dashboard (app/web.py) reads data/state.json and writes data/cmd.json;
 this bot applies those commands. Env + data/config.json override strategy
 params live.
@@ -63,7 +64,6 @@ def cfg() -> MParams:
         fast=int(os.environ.get("MACD_FAST", "12")),
         slow=int(os.environ.get("MACD_SLOW", "26")),
         signal=int(os.environ.get("MACD_SIGNAL", "9")),
-        pivot=int(os.environ.get("MACD_PIVOT", "2")),
         fee_pct=float(os.environ.get("FEE_PCT", "0.1")),
     )
     path = os.path.join(DATA, "config.json")
@@ -239,7 +239,7 @@ def make_chart(symbol, df, pos):
     ax.set_xlim(-1, len(d))
     ax.grid(color="#21262d", lw=0.5)
     axm.grid(color="#21262d", lw=0.5)
-    fig.text(0.01, 0.01, "SK System | MACD-DCA | покупка $300 на нижней точке MACD (<0) · продажа всего на верхней (>0) | спот",
+    fig.text(0.01, 0.01, "SK System | MACD-DCA | покупка $300 на пересечении вверх MACD<0 · продажа всего на пересечении вниз MACD>0 | спот",
              color="#8b949e", fontsize=7)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
@@ -369,7 +369,7 @@ def _fees(notional, p):
 
 
 def buy_lot(symbol, px, info, df, p):
-    """Докупка лота на нижней точке MACD (спот, демо-учёт кэшем)."""
+    """Докупка лота на пересечении вверх MACD ниже нуля (спот, демо-учёт кэшем)."""
     lot = float(info["lot_usd"])
     pos = book.open.get(symbol)
     if pos is None:
@@ -394,18 +394,18 @@ def buy_lot(symbol, px, info, df, p):
     tg_photo(make_chart(symbol, df, pos), NL.join([
         f"🟢 <b>MACD-DCA — покупка лота #{n}</b>",
         f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · спот, без плеча",
-        f"#{symbol} · {TF} · MACD нижняя точка <code>{info['macd']:.6g}</code> (<0)",
+        f"#{symbol} · {TF} · MACD <code>{info['macd']:.6g}</code> пересёк сигнальную ВВЕРХ (<0)",
         "",
         f"👉 Куплено на <code>{fmt_px(px)}</code> на ${lot:g}",
         f"📦 Всего лотов: {n} · вложено <b>${invested:g}</b> · средняя цена <code>{fmt_px(avg)}</code>",
         f"🏦 Balance: {book.balance:,.2f} USDT",
         "",
-        f"Продам всё, когда MACD коснётся высокой точки выше нуля.",
+        f"Продам всё, когда MACD пересечёт сигнальную ВНИЗ выше нуля.",
     ]))
 
 
 def sell_all(symbol, px, info, df, p):
-    """Продажа всей позиции на верхней точке MACD."""
+    """Продажа всей позиции на пересечении вниз MACD выше нуля."""
     pos = book.open.get(symbol)
     if not pos or not pos["lots"]:
         return
@@ -442,7 +442,7 @@ def sell_all(symbol, px, info, df, p):
     log_event(f"SELL ALL #{symbol} @ {fmt_px(px)} {pnl:+.2f} USDT")
     tg_photo(make_chart(symbol, df, None), NL.join([
         f"{'✅' if won else '📉'} <b>MACD-DCA — продано ВСЁ</b> ({'профит' if won else 'убыток'})",
-        f"#{symbol} · {TF} · MACD высокая точка <code>{info['macd']:.6g}</code> (>0)",
+        f"#{symbol} · {TF} · MACD <code>{info['macd']:.6g}</code> пересёк сигнальную ВНИЗ (>0)",
         "",
         f"├ Лотов куплено: {len(lots)} на ${invested:g}",
         f"├ Продано по: <code>{fmt_px(px)}</code>",
@@ -759,8 +759,8 @@ def main():
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
                      f"├ Universe: CoinGecko top-{len(STATE['universe'])} by market cap",
                      "├ Timeframe: " + TF + " · MACD-DCA (спот, без плеча)",
-                     "├ Покупка $" + f"{cfg().lot_usd:g}" + " на каждой нижней точке MACD (<0), макс. лотов " + f"{cfg().max_lots}",
-                     "├ Продажа ВСЕГО на высокой точке MACD (>0)",
+                     "├ Покупка $" + f"{cfg().lot_usd:g}" + " на пересечении вверх MACD<0, макс. лотов " + f"{cfg().max_lots}",
+                     "├ Продажа ВСЕГО на пересечении вниз MACD>0",
                      f"├ Капитал ${book.start_balance:g} · макс. {MAX_POS} монет в работе · топ-{TOP_N} по капитализации",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
     threading.Thread(target=command_poller, daemon=True).start()

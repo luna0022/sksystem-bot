@@ -294,12 +294,12 @@ def _to_df6(rows):
 
 
 def fetch_klines_ex(symbol, interval, exchange, limit=200):
-    """Unified klines. interval: 1h / 4h / 1d."""
+    """Unified klines. interval: 15m / 1h / 4h / 1d."""
     if exchange == "binance":
         df = fetch_klines(symbol, interval, limit=limit)
         return df[["open_time", "open", "high", "low", "close", "volume"]]
     if exchange == "kucoin":
-        tmap = {"1h": "1hour", "4h": "4hour", "1d": "1day"}
+        tmap = {"15m": "15min", "1h": "1hour", "4h": "4hour", "1d": "1day"}
         r = requests.get("https://api.kucoin.com/api/v1/market/candles",
                          params={"type": tmap[interval], "symbol": symbol[:-4] + "-USDT"},
                          timeout=30)
@@ -308,7 +308,7 @@ def fetch_klines_ex(symbol, interval, exchange, limit=200):
                 for k in reversed(r.json()["data"])]  # time, open, high, low, close, vol
         return _to_df6(rows).tail(limit)
     if exchange == "bybit":
-        imap = {"1h": "60", "4h": "240", "1d": "D"}
+        imap = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
         r = requests.get("https://api.bybit.com/v5/market/kline",
                          params={"category": "spot", "symbol": symbol,
                                  "interval": imap[interval], "limit": limit}, timeout=30)

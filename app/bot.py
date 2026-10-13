@@ -37,10 +37,11 @@ log = logging.getLogger("sksystem")
 DATA = os.environ.get("DATA_DIR", "/app/data")
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHATS = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
-TF = os.environ.get("TF", "1h")
-if TF not in ("1h", "4h"):
-    TF = "1h"
-SECONDS = {"1h": 3600, "4h": 14400}
+VALID_TFS = ("15m", "1h", "4h", "1d")
+TF = os.environ.get("TF", "4h")
+if TF not in VALID_TFS:
+    TF = "4h"
+SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 TOP_N = int(os.environ.get("TOP_N", "200"))
 MAX_POS = int(os.environ.get("MAX_POSITIONS", "10"))
 DEMO = os.environ.get("DEMO", "true").lower() == "true"
@@ -95,6 +96,7 @@ COMMANDS = [
     ("status", "статус и позиции"), ("table", "таблица позиций"), ("profit", "профит и баланс"),
     ("balance", "демо-баланс"), ("daily", "статистика за день"), ("performance", "по парам"),
     ("count", "счётчики"), ("reset", "сброс статистики"), ("help", "справка"),
+    ("tf", "смена таймфрейма: /tf 15m, 1h, 4h или 1d"),
 ]
 
 
@@ -119,6 +121,10 @@ INLINE_MENU = {
         [{"text": "▶️ Start", "callback_data": "/start"},
          {"text": "⏹ Stop", "callback_data": "/stop"},
          {"text": "🔢 Count", "callback_data": "/count"}],
+        [{"text": "⏱ 15м", "callback_data": "/tf 15m"},
+         {"text": "⏱ 1ч", "callback_data": "/tf 1h"},
+         {"text": "⏱ 4ч", "callback_data": "/tf 4h"},
+         {"text": "⏱ 1д", "callback_data": "/tf 1d"}],
         [{"text": "🔄 Reset", "callback_data": "/reset"}],
     ]
 }
@@ -507,6 +513,7 @@ def cmd_status():
     lines = [
         "📈 <b>Status</b>",
         f"├ Scanner: {'⏹ paused' if STATE['paused'] else '▶️ running'}",
+        f"├ Timeframe: {TF} · лонг/шорт фьючерсы {LONG_LEVERAGE:g}x/{SHORT_LEVERAGE:g}x",
         f"├ Universe: {len(STATE['universe'])} symbols",
         f"├ Last scan: {STATE.get('last_scan') or '—'}",
         f"├ Entries total: {STATE.get('entries', 0)}",
@@ -600,6 +607,29 @@ def do_reset():
     STATE["processed"] = {}
 
 
+def set_tf(new):
+    """Смена таймфрейма на лету. Трекеры и кэш свечей сбрасываются (прогрев
+    заново), открытые демо-позиции закрываются без PnL по цене входа —
+    иначе менеджер позиций (внутри трекера) потерял бы их."""
+    global TF
+    new = (new or "").strip().lower()
+    if new not in VALID_TFS:
+        return None
+    if new == TF:
+        return TF
+    n_open = len(book.open)
+    book.open.clear()          # маржа в демо не резервировалась — баланс не трогаем
+    book.save()
+    STATE["trackers"] = {}
+    STATE["processed"] = {}
+    STATE["cache"] = {}
+    STATE["exch"] = {}
+    TF = new
+    log.info("timeframe switched to %s (%d open positions dropped)", TF, n_open)
+    log_event(f"TF switched to {TF}")
+    return TF
+
+
 def dispatch(text):
     t = text.strip().lower()
     if t in ("/start", "▶️ start"):
@@ -627,6 +657,17 @@ def dispatch(text):
     elif t in ("/reset", "🔄 reset"):
         do_reset()
         tg_send("🔄 Stats and demo balance <b>reset</b>", kb=True)
+    elif t.startswith("/tf"):
+        parts = t.split(maxsplit=1)
+        arg = parts[1] if len(parts) > 1 else ""
+        cur = set_tf(arg)
+        if cur is None:
+            tg_send("❓ Такого таймфрейма нет. Доступно: 15m · 1h · 4h · 1d", kb=True)
+        elif cur == arg:
+            tg_send(f"⏱ Таймфрейм переключён на <b>{cur}</b>. Трекеры и прогрев сброшены, "
+                    f"открытые позиции закрыты без PnL. Ближайший цикл — прогрев заново.", kb=True)
+        else:
+            tg_send(f"⏱ Таймфрейм уже <b>{cur}</b>", kb=True)
     elif t in ("/menu", "menu", "меню"):
         tg_send_menu()
 
@@ -735,7 +776,7 @@ def main():
     tg_set_commands()
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
                      f"├ Universe: Binance top-{len(STATE['universe'])} by 24h volume",
-                     "├ Timeframe: " + TF + " · стратегия 0→A→B (лонг 1x спот + шорт 2x фьючерсы)",
+                     "├ Timeframe: " + TF + " · стратегия 0→A→B (лонг/шорт фьючерсы)",
                      "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
                      "├ TP1 +2% на 30% · TP2 (1.618) закрывает 100%",
                      f"├ Вход ${cfg().entry_usd:g} · плечо {LONG_LEVERAGE:g}x лонг / {SHORT_LEVERAGE:g}x шорт · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",

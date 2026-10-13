@@ -6,6 +6,8 @@ Universe: топ-N по капитализации (CoinGecko), пересечё
 Timeframe: 4ч (переключается кнопками 15m/1h/4h/1d). MacdTracker: MACD(12,26,9),
 покупка лота $400 на пересечении ВВЕРХ линии MACD через сигнальную, пока MACD < 0
 (макс. 6 лотов), продажа ВСЕГО на пересечении ВНИЗ, пока MACD > 0.
+Лот авто-растёт от профита: каждые PROFIT_STEP_USD (по умолчанию = лот) чистой
+прибыли сверх стартового капитала добавляют +1 базовый лот.
 Плеча нет — ликвидаций не существует.
 Web dashboard (app/web.py) reads data/state.json and writes data/cmd.json;
 this bot applies those commands. Env + data/config.json override strategy
@@ -312,6 +314,16 @@ def load_symbol(symbol):
     return df.tail(WARMUP_BARS).reset_index(drop=True) if not df.empty else df
 
 
+def dyn_lot(p):
+    """Лот растёт от чистого профита: пока кэш выше стартового капитала,
+    каждые PROFIT_STEP_USD накопленной прибыли (по умолчанию = базовый лот)
+    добавляют ещё один базовый лот. Пример: лот $400, профит $850 -> лот $800.
+    Убыток или открытые мешки лот не уменьшают ниже базового."""
+    step = float(os.environ.get("PROFIT_STEP_USD", str(p.lot_usd)))
+    profit = max(0.0, book.balance - book.start_balance)
+    return p.lot_usd * (1 + int(profit // step))
+
+
 def process_symbol(symbol, p):
     cache = STATE["cache"]
     # инициализируем трекер, если его нет (новая монета или сброс через reset:
@@ -347,6 +359,7 @@ def process_symbol(symbol, p):
     hv, lv = df["high"].values, df["low"].values
     ov, cv = df["open"].values, df["close"].values
     tr = STATE["trackers"][symbol]
+    tr.p = p                    # лот мог вырасти от профита — синхронизируем
 
     def can_spend():
         return (book.balance >= p.lot_usd
@@ -396,7 +409,8 @@ def buy_lot(symbol, px, info, df, p):
         f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · спот, без плеча",
         f"#{symbol} · {TF} · MACD <code>{info['macd']:.6g}</code> пересёк сигнальную ВВЕРХ (<0)",
         "",
-        f"👉 Куплено на <code>{fmt_px(px)}</code> на ${lot:g}",
+        f"👉 Куплено на <code>{fmt_px(px)}</code> на ${lot:g}"
+        + (" 🚀 (лот вырос от профита)" if lot > cfg().lot_usd else ""),
         f"📦 Всего лотов: {n} · вложено <b>${invested:g}</b> · средняя цена <code>{fmt_px(avg)}</code>",
         f"🏦 Balance: {book.balance:,.2f} USDT",
         "",
@@ -459,7 +473,7 @@ def cmd_status():
     lines = [
         "📈 <b>Status</b>",
         f"├ Scanner: {'⏹ paused' if STATE['paused'] else '▶️ running'}",
-        f"├ Timeframe: {TF} · MACD-DCA спот · лот ${cfg().lot_usd:g} · макс. лотов {cfg().max_lots}",
+        f"├ Timeframe: {TF} · MACD-DCA спот · лот ${dyn_lot(cfg()):g} (растёт от профита) · макс. лотов {cfg().max_lots}",
         f"├ Universe: {len(STATE['universe'])} symbols",
         f"├ Last scan: {STATE.get('last_scan') or '—'}",
         f"├ Entries total: {STATE.get('entries', 0)}",
@@ -759,7 +773,8 @@ def main():
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
                      f"├ Universe: CoinGecko top-{len(STATE['universe'])} by market cap",
                      "├ Timeframe: " + TF + " · MACD-DCA (спот, без плеча)",
-                     "├ Покупка $" + f"{cfg().lot_usd:g}" + " на пересечении вверх MACD<0, макс. лотов " + f"{cfg().max_lots}",
+                     "├ Покупка $" + f"{dyn_lot(cfg()):g}" + " на пересечении вверх MACD<0, макс. лотов " + f"{cfg().max_lots}",
+                     "├ Лот авто-растёт: каждые $" + f"{float(os.environ.get('PROFIT_STEP_USD', str(cfg().lot_usd))):g}" + " чистого профита = +1 лот к входу",
                      "├ Продажа ВСЕГО на пересечении вниз MACD>0",
                      f"├ Капитал ${book.start_balance:g} · макс. {MAX_POS} монет в работе · топ-{TOP_N} по капитализации",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
@@ -781,6 +796,7 @@ def main():
         if STATE["paused"]:
             continue
         p = cfg()
+        p.lot_usd = dyn_lot(p)      # лот растёт от накопленного профита
         t0 = time.time()
         for i, symbol in enumerate(STATE["universe"]):
             try:

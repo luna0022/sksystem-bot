@@ -4,7 +4,7 @@
 
 Universe: топ-N по капитализации (CoinGecko), пересечённый с USDT-парами KuCoin.
 Timeframe: 4ч (переключается кнопками 15m/1h/4h/1d). MacdTracker: MACD(12,26,9),
-покупка лота $300 на пересечении ВВЕРХ линии MACD через сигнальную, пока MACD < 0
+покупка лота $500 на пересечении ВВЕРХ линии MACD через сигнальную, пока MACD < 0
 (макс. 6 лотов), продажа ВСЕГО на пересечении ВНИЗ, пока MACD > 0.
 Плеча нет — ликвидаций не существует.
 Web dashboard (app/web.py) reads data/state.json and writes data/cmd.json;
@@ -239,7 +239,7 @@ def make_chart(symbol, df, pos):
     ax.set_xlim(-1, len(d))
     ax.grid(color="#21262d", lw=0.5)
     axm.grid(color="#21262d", lw=0.5)
-    fig.text(0.01, 0.01, "SK System | MACD-DCA | покупка $300 на пересечении вверх MACD<0 · продажа всего на пересечении вниз MACD>0 | спот",
+    fig.text(0.01, 0.01, "SK System | MACD-DCA | покупка $500 на пересечении вверх MACD<0 · продажа всего на пересечении вниз MACD>0 | спот",
              color="#8b949e", fontsize=7)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")

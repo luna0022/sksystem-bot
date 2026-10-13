@@ -27,7 +27,7 @@ class MParams:
     fast: int = 12
     slow: int = 26
     signal: int = 9
-    lot_usd: float = 300.0    # размер одной докупки
+    lot_usd: float = 500.0    # размер одной докупки
     max_lots: int = 6         # мартингейл-ограничение (капитал)
     fee_pct: float = 0.1      # спот, обе стороны
 

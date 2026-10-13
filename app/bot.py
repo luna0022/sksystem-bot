@@ -742,15 +742,46 @@ def write_state():
 
 # ---------------------------------------------------------------- main
 
+STABLES = {"USDT", "USDC", "USDS", "DAI", "FDUSD", "TUSD", "USDE", "BUSD",
+           "USDJ", "EURI", "XUSD", "BFUSD", "WUSD", "USDP", "FRAX", "LUSD",
+           "GUSD", "PYUSD", "EURC", "AEUR", "USDSB", "USD1", "USDD", "SUSDE"}
+
+
+def fetch_top_by_market_cap(n):
+    """Топ-n по КАПИТАЛИЗАЦИИ (CoinGecko), оставляем только монеты с
+    торгуемой USDT-парой на KuCoin. Стейблы и мелочь < $50млн капы — прочь."""
+    cap = []
+    for page in (1, 2):
+        r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
+                         params={"vs_currency": "usd", "order": "market_cap_desc",
+                                 "per_page": 250, "page": page}, timeout=30)
+        r.raise_for_status()
+        cap += [(c["symbol"].upper(), c.get("market_cap") or 0) for c in r.json()]
+    r = requests.get("https://api.kucoin.com/api/v2/symbols", timeout=30)
+    r.raise_for_status()
+    kusdt = {s["baseCurrency"] for s in r.json()["data"]
+             if s["quoteCurrency"] == "USDT" and s.get("enableTrading")}
+    out = []
+    for sym, mc in cap:
+        if sym in STABLES or mc < 50_000_000:
+            continue
+        if sym in kusdt:
+            out.append(sym + "USDT")
+        if len(out) >= n:
+            break
+    return out
+
+
 def build_universe():
-    """(symbols, exchange). Binance top-200 предпочтительно; если Binance
-    гео-блочит серверный IP (451) — KuCoin: те же монеты и цены."""
+    """(symbols, exchange). Вселенная — топ по КАПИТАЛИЗАЦИИ (CoinGecko),
+    пересечённый с USDT-парами KuCoin (Binance с сервера всё равно гео-блок).
+    Фолбэки: старые списки по обороту, затем кэш."""
     try:
-        uni = fetch_binance_top_usdt(TOP_N)
+        uni = fetch_top_by_market_cap(TOP_N)
         if uni:
-            return uni, "binance"
+            return uni, "kucoin"
     except Exception as e:
-        log.error("binance universe failed: %s", e)
+        log.error("coingecko cap universe failed: %s", e)
     try:
         uni = fetch_kucoin_top_usdt(TOP_N)
         if uni:
@@ -767,7 +798,8 @@ def main():
     STATE["exch_map"] = ex_map
     STATE["map_ts"] = time.time()
     STATE["universe"] = sorted(ex_map.keys())
-    log.info("universe: %d symbols via %s (Binance top by 24h volume)", len(STATE["universe"]), ex)
+    log.info("universe: %d symbols via %s (CoinGecko top-%d by market cap)",
+             len(STATE["universe"]), ex, TOP_N)
     try:
         probe = fetch_klines("BTCUSDT", TF, limit=2)
         log.info("binance api check OK (%d rows)", len(probe))
@@ -775,7 +807,7 @@ def main():
         log.error("binance api check FAILED: %s", e)
     tg_set_commands()
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
-                     f"├ Universe: Binance top-{len(STATE['universe'])} by 24h volume",
+                     f"├ Universe: CoinGecko top-{len(STATE['universe'])} by market cap",
                      "├ Timeframe: " + TF + " · стратегия 0→A→B (лонг/шорт фьючерсы)",
                      "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
                      "├ TP1 +2% на 30% · TP2 (1.618) закрывает 100%",

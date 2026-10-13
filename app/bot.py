@@ -1,14 +1,11 @@
 
 #!/usr/bin/env python3
-"""SK System Telegram signal bot — стратегия 0->A->B (SK v6), спот, только лонг.
+"""SK System Telegram signal bot — стратегия MACD-DCA, спот, только лонг.
 
-Universe: топ-200 USDT-пар Binance по суточному объёму (обновляется раз в 6 ч).
-Timeframe: 1h. Каждый раунд (5 мин) новым закрытым свечам каждого символа
-скармливается SKTracker: детекция 0->A->B -> сигнал в точке B (касание зоны
-0.5-0.786) -> вход $100 с капитала $1000 (макс. 10 позиций).
-Money management: TP1 +2% на 30%, TP2 1.618 на 30%, TP3 2.0 на 40%,
-SL: закрытие ниже B / пробой точки 0 (аварийный стоп).
-
+Universe: топ-N по капитализации (CoinGecko), пересечённый с USDT-парами KuCoin.
+Timeframe: 4ч (переключается кнопками 15m/1h/4h/1d). MacdTracker: MACD(12,26,9),
+покупка лота $300 на каждой подтверждённой нижней точке MACD (<0), макс. 6 лотов,
+продажа ВСЕГО на высокой точке MACD (>0). Плеча нет — ликвидаций не существует.
 Web dashboard (app/web.py) reads data/state.json and writes data/cmd.json;
 this bot applies those commands. Env + data/config.json override strategy
 params live.
@@ -22,11 +19,12 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.strategy_0ab import SParams, SKTracker, invert_event
+from app.strategy_macd import MParams, MacdTracker
 from app.market import (fetch_klines, fetch_history, load_universe, build_exchange_map,
                         fetch_klines_ex, ping_exchange, EXCHANGES,
                         fetch_binance_top_usdt, fetch_kucoin_top_usdt)
@@ -45,13 +43,6 @@ SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 TOP_N = int(os.environ.get("TOP_N", "200"))
 MAX_POS = int(os.environ.get("MAX_POSITIONS", "10"))
 DEMO = os.environ.get("DEMO", "true").lower() == "true"
-LEVERAGE = float(os.environ.get("LEVERAGE", "1"))
-# плечо по направлениям: лонг и шорт — фьючерсы, 2x (максимум)
-LONG_LEVERAGE = float(os.environ.get("LONG_LEVERAGE", os.environ.get("LEVERAGE", "2")))
-SHORT_LEVERAGE = float(os.environ.get("SHORT_LEVERAGE", "2"))
-# с плечом>1: не берём сетапы, где стоп дальше MAX_STOP_PCT% от входа
-# (иначе ликвидация наступит раньше стопа: у 3x маржа сгорает при ~-30% цены)
-MAX_STOP_PCT = float(os.environ.get("MAX_STOP_PCT", "8"))
 WARMUP_BARS = 400
 
 NL = chr(10)
@@ -64,18 +55,16 @@ KB = {"keyboard": [["📊 Daily", "💰 Profit", "🏦 Balance"],
 os.makedirs(DATA, exist_ok=True)
 
 
-def cfg() -> SParams:
+def cfg() -> MParams:
     """Params from env, overridden by data/config.json (live-tunable)."""
-    p = SParams(
-        entry_usd=float(os.environ.get("ENTRY_USD", "100")),
-        capital_usd=float(os.environ.get("CAPITAL_USD", "1000")),
-        tp1_pct=float(os.environ.get("TP1_PCT", "2.0")),
-        tp1_frac=float(os.environ.get("TP1_FRAC", "0.30")),
-        entry_mode=os.environ.get("ENTRY_MODE", "zone"),
-        min_impulse_atr=float(os.environ.get("MIN_IMPULSE_ATR", "1.5")),
-        zone_min=float(os.environ.get("ZONE_MIN", "0.5")),
-        zone_max=float(os.environ.get("ZONE_MAX", "0.786")),
-        life_active=int(os.environ.get("LIFE_ACTIVE", "150")),
+    p = MParams(
+        lot_usd=float(os.environ.get("LOT_USD", "300")),
+        max_lots=int(os.environ.get("MAX_LOTS", "6")),
+        fast=int(os.environ.get("MACD_FAST", "12")),
+        slow=int(os.environ.get("MACD_SLOW", "26")),
+        signal=int(os.environ.get("MACD_SIGNAL", "9")),
+        pivot=int(os.environ.get("MACD_PIVOT", "2")),
+        fee_pct=float(os.environ.get("FEE_PCT", "0.1")),
     )
     path = os.path.join(DATA, "config.json")
     if os.path.exists(path):
@@ -188,57 +177,69 @@ def fmt_px(v):
 # ------------------------------------------------------------- charts
 
 def make_chart(symbol, df, pos):
+    """Свечи + панель MACD, маркеры лотов и средняя цена входа."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
-    d = df.tail(72).reset_index(drop=True)
+    from app.strategy_macd import MacdTracker
+    d = df.tail(150).reset_index(drop=True)
     up, dn = "#26a69a", "#ef5350"
-    fig, ax = plt.subplots(figsize=(6.4, 4.2), dpi=110)
+    fig, (ax, axm) = plt.subplots(2, 1, figsize=(6.4, 5.2), dpi=110,
+                                  sharex=True, gridspec_kw={"height_ratios": [3, 1]})
     fig.patch.set_facecolor("#0d1117")
-    ax.set_facecolor("#10231a")
+    ax.set_facecolor("#0d1117")
+    axm.set_facecolor("#0d1117")
     for i, r in d.iterrows():
         cnd = up if r["close"] >= r["open"] else dn
         ax.plot([i, i], [r["low"], r["high"]], color=cnd, lw=0.8, zorder=2)
         lo_, hi_ = min(r["open"], r["close"]), max(r["open"], r["close"])
         ax.add_patch(Rectangle((i - 0.32, lo_), 0.64, max(hi_ - lo_, 1e-9),
                                facecolor=cnd, edgecolor=cnd, zorder=3))
-    # «зелёный блок»: цели 1.618 / 1.809 / 2.0 от B
-    lv = pos.get("lv") or []
-    if lv:
-        top = max(px for _, px in lv)
-        bot = min(px for _, px in lv)
-        off = len(df) - 72
-        x0 = max(int(pos.get("opened_i", len(df))) - off, 0)
-        ax.add_patch(Rectangle((x0, bot), len(d) - x0 + 4, top - bot,
-                               facecolor="#26a69a", alpha=0.13,
-                               edgecolor="#26a69a", lw=1.0, zorder=1))
-        ax.text(x0 + 0.3, top, "block TP", color="#3fb68b", fontsize=8, va="bottom")
-        for k, (name, y) in enumerate(lv):
-            ax.hlines(y, -1, len(d), colors="#2ea87e", linestyles=":", lw=1.0)
-            ax.text(len(d) - 0.5, y, f"{name}  {fmt_px(y)}",
-                    color="#7ee0bb", fontsize=7, va="center", ha="right",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="#0d1117", ec="#2ea87e", lw=0.5))
-    xmin, xmax = -1, len(d)
-    _lng = pos.get("dir", 1) == 1
-    rows = [(pos["entry"], "#ffd54a", "ENTRY", "--"),
-            (pos["tp1"], up, "TP1 +2%", "-"),
-            (pos["fail_px"], dn, "SL (close<B)" if _lng else "SL (close>B)", "-"),
-            (pos["cat_sl"], "#b04a4a", "SL catastr (0)", ":")]
-    for y, c_, name, st in rows:
-        pct = (y - pos["entry"]) / pos["entry"] * 100
-        ax.hlines(y, xmin, xmax, colors=c_, linestyles=st, lw=1.4)
-        ax.text(xmax - 0.5, y, f"{name}  {fmt_px(y)}  ({pct:+.1f}%)", color=c_,
+    # маркеры лотов + средняя цена
+    off = max(len(df) - 150, 0)
+    lots = (pos or {}).get("lots") or []
+    invested = sum(l for _, l in lots)
+    if lots:
+        qty = sum(l / px for px, l in lots)
+        avg = invested / qty
+        xs = [k - off for k, (px, _l) in enumerate(lots)]
+        ax.scatter(xs, [px for px, _l in lots], marker="^", s=70,
+                   color="#ffd54a", zorder=5, label=f"buy lots ({len(lots)})")
+        ax.hlines(avg, -1, len(d), colors="#ffd54a", linestyles="--", lw=1.4)
+        ax.text(len(d) - 0.5, avg, f"avg {fmt_px(avg)}", color="#ffd54a",
                 fontsize=8, va="center", ha="right",
-                bbox=dict(boxstyle="round,pad=0.25", fc="#0d1117", ec=c_, lw=0.6))
-    ax.set_title(f"#{symbol} · {TF} · {'LONG' if pos.get('dir', 1) == 1 else 'SHORT'} · SK 0→A→B", color="#e6edf3",
-                 fontsize=10, loc="left")
-    ax.tick_params(colors="#8b949e", labelsize=7)
-    for sp in ax.spines.values():
-        sp.set_color("#30363d")
-    ax.set_xlim(xmin, xmax)
+                bbox=dict(boxstyle="round,pad=0.25", fc="#0d1117", ec="#ffd54a", lw=0.6))
+    # MACD
+    tr = MacdTracker(cfg())
+    tr.armed = False
+    hv, lv = d["high"].values, d["low"].values
+    ov, cv = d["open"].values, d["close"].values
+    for i in range(len(d)):
+        tr.update(hv, lv, ov, cv, i)
+    m = [x if x is not None else float("nan") for x in tr.macd]
+    sg = [x if x is not None else float("nan") for x in tr.sig]
+    axm.plot(m, color="#58a6ff", lw=1.2, label="MACD")
+    axm.plot(sg, color="#e6edf3", lw=1.0, label="signal")
+    axm.axhline(0, color="#8b949e", lw=0.6)
+    axm.fill_between(range(len(d)), m, sg,
+                     where=[(not np.isnan(a)) and (not np.isnan(b)) and a >= b
+                            for a, b in zip(m, sg)],
+                     color=up, alpha=0.25)
+    axm.fill_between(range(len(d)), m, sg,
+                     where=[(not np.isnan(a)) and (not np.isnan(b)) and a < b
+                            for a, b in zip(m, sg)],
+                     color=dn, alpha=0.25)
+    ax.set_title(f"#{symbol} · {TF} · MACD-DCA (спот)", color="#e6edf3", fontsize=10, loc="left")
+    axm.legend(loc="upper left", fontsize=7, labelcolor="#8b949e", frameon=False)
+    for a_ in (ax, axm):
+        a_.tick_params(colors="#8b949e", labelsize=7)
+        for sp in a_.spines.values():
+            sp.set_color("#30363d")
+    ax.set_xlim(-1, len(d))
     ax.grid(color="#21262d", lw=0.5)
-    fig.text(0.01, 0.01, "SK System | 0→A→B | сигнал в точке B | TP1 +2%/30% · TP2 1.618 = 100% | SL: закрытие<B",
+    axm.grid(color="#21262d", lw=0.5)
+    fig.text(0.01, 0.01, "SK System | MACD-DCA | покупка $300 на нижней точке MACD (<0) · продажа всего на верхней (>0) | спот",
              color="#8b949e", fontsize=7)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
@@ -253,8 +254,8 @@ class Book:
         self.open = {}
         self.per_pair = {}
         self.wins = self.losses = self.tps = self.sls = self.times = 0
-        self.balance = 1000.0
-        self.start_balance = 1000.0
+        self.balance = float(os.environ.get("CAPITAL_USD", "2000"))
+        self.start_balance = float(os.environ.get("CAPITAL_USD", "2000"))
         self.trade_no = 0
         self.signals = 0
         self.scans = 0
@@ -318,20 +319,16 @@ def process_symbol(symbol, p):
     if symbol not in STATE["trackers"]:
         df0 = load_symbol(symbol)
         cache[symbol] = df0
-        tr_l, tr_s = SKTracker(p), SKTracker(p)
+        tr = MacdTracker(p)
         if not df0.empty:
-            # прокручиваем тёплые бары: детектор сразу видит структуры
-            # 0->A->B, уже находящиеся в работе (позиции не открываем).
-            # Шорт-трекер крутим в инвертированном пространстве цен
-            # (-high/-low/...): падения становятся ростом, шорт = зеркальный лонг.
-            tr_l.armed = tr_s.armed = False
+            # прогрев: MACD и пивоты считаются по истории, события не эмитим
+            tr.armed = False
             hv, lv = df0["high"].values, df0["low"].values
             ov, cv = df0["open"].values, df0["close"].values
             for i in range(len(df0) - 1):
-                tr_l.update(hv, lv, ov, cv, i)
-                tr_s.update(-lv, -hv, -ov, -cv, i)
-            tr_l.armed = tr_s.armed = True
-        STATE["trackers"][symbol] = (tr_l, tr_s)
+                tr.update(hv, lv, ov, cv, i)
+            tr.armed = True
+        STATE["trackers"][symbol] = tr
         STATE["processed"][symbol] = len(df0) - 2
         return
     df = cache[symbol]
@@ -349,39 +346,21 @@ def process_symbol(symbol, p):
         return
     hv, lv = df["high"].values, df["low"].values
     ov, cv = df["open"].values, df["close"].values
-    tr_l, tr_s = STATE["trackers"][symbol]
+    tr = STATE["trackers"][symbol]
 
-    def handle(ev, d, lev):
-        if ev[0] == "sig":
-            _, entry, info = ev
-            if STATE["paused"] or len(book.open) >= MAX_POS or symbol in book.open:
-                return
-            if lev > 1 and info.get("fail_px"):
-                stop_pct = abs(entry - info["fail_px"]) / entry * 100
-                if stop_pct > MAX_STOP_PCT:
-                    log.info("skip %s %s: stop %.1f%% > max %.1f%% (leverage %gx)",
-                             symbol, "LONG" if d == 1 else "SHORT",
-                             stop_pct, MAX_STOP_PCT, lev)
-                    return
-            open_pos(symbol, d, entry, info, df, p, lev)
-        elif ev[0] == "part" and symbol in book.open:
-            pos = book.open[symbol]
-            if pos["dir"] != d:
-                return
-            _, px, frac, label = ev
-            part_pos(symbol, pos, float(px), float(frac), label, p)
-        elif ev[0] == "exit" and symbol in book.open:
-            pos = book.open[symbol]
-            if pos["dir"] != d:
-                return
-            _, px, reason = ev
-            close_pos(symbol, pos, float(px), reason, p)
+    def can_spend():
+        return (book.balance >= p.lot_usd
+                and (symbol in book.open or len(book.open) < MAX_POS))
 
     for i in range(STATE["processed"].get(symbol, 0) + 1, last_closed + 1):
-        for ev in tr_l.update(hv, lv, ov, cv, i):
-            handle(ev, 1, LONG_LEVERAGE)
-        for ev in tr_s.update(-lv, -hv, -ov, -cv, i):
-            handle(invert_event(ev), -1, SHORT_LEVERAGE)
+        tr.can_buy = can_spend()
+        for ev in tr.update(hv, lv, ov, cv, i):
+            if ev[0] == "buy":
+                _, px, info = ev
+                buy_lot(symbol, px, info, df, p)
+            elif ev[0] == "sell_all":
+                _, px, info = ev
+                sell_all(symbol, px, info, df, p)
     STATE["processed"][symbol] = last_closed
 
 
@@ -389,122 +368,89 @@ def _fees(notional, p):
     return notional * p.fee_pct / 100.0 * 2   # вход + выход
 
 
-def open_pos(symbol, d, entry, info, df, p, lev):
-    pos = {"dir": d, "entry": entry, "opened": time.time(), "lev": lev,
-           "p0": info["p0"], "pA": info["pA"], "pB": info["pB"],
-           "fail_px": info["fail_px"], "cat_sl": info["cat_sl"],
-           "tp1": info["tp1"], "lv": [(lv, px) for lv, px in info["lv"]],
-           "left_frac": 1.0, "entry_usd": p.entry_usd,
-           "opened_i": int(info["opened_i"])}
+def buy_lot(symbol, px, info, df, p):
+    """Докупка лота на нижней точке MACD (спот, демо-учёт кэшем)."""
+    lot = float(info["lot_usd"])
+    pos = book.open.get(symbol)
+    if pos is None:
+        pos = {"lots": [], "opened": time.time()}
+        book.open[symbol] = pos
+    fee = lot * p.fee_pct / 100.0
+    pos["lots"].append([px, lot])
+    book.balance -= lot + fee
     book.trade_no += 1
     book.signals += 1
     STATE["entries"] = STATE.get("entries", 0) + 1
     pp = book.per_pair.setdefault(symbol, {"signals": 0, "closed": 0, "wins": 0,
                                            "losses": 0, "pnl": 0.0})
     pp["signals"] += 1
-    book.open[symbol] = pos
     book.save()
-    log.info("signal %s %s entry=%s p0=%s pA=%s", symbol,
-             "LONG" if d == 1 else "SHORT", entry, info["p0"], info["pA"])
-    log_event(f"OPEN {'LONG' if d == 1 else 'SHORT'} #{symbol} @ {fmt_px(entry)}")
-    block = " · ".join(f"{lv} → {fmt_px(px)} ({(px - entry) / entry * 100:+.1f}%)"
-                       for lv, px in pos["lv"])
-    dir_txt = "🟢 LONG" if d == 1 else "🔴 SHORT (фьючерсы)"
-    sl_txt = (f"🛑 SL: закрытие ниже B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа ниже 0 (<code>{fmt_px(info['cat_sl'])}</code>)"
-              if d == 1 else
-              f"🛑 SL: закрытие выше B (<code>{fmt_px(info['fail_px'])}</code>) · катастрофа выше 0 (<code>{fmt_px(info['cat_sl'])}</code>)")
+    n = len(pos["lots"])
+    invested = sum(l for _, l in pos["lots"])
+    qty = sum(l / e for e, l in pos["lots"])
+    avg = invested / qty
+    log.info("buy %s lot #%d price=%s invested=%.2f", symbol, n, px, invested)
+    log_event(f"BUY #{symbol} lot {n} @ {fmt_px(px)} (${lot:g})")
     tg_photo(make_chart(symbol, df, pos), NL.join([
-        "🔵 <b>Сигнал SK 0→A→B — точка B</b>",
-        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · вход ${p.entry_usd:g} · плечо {lev:g}x (номинал ${p.entry_usd * lev:g}) · капитал ${p.capital_usd:g}",
-        f"#{symbol} · {TF} · {dir_txt}",
+        f"🟢 <b>MACD-DCA — покупка лота #{n}</b>",
+        f"Trade #{book.trade_no}{' · DEMO' if DEMO else ''} · спот, без плеча",
+        f"#{symbol} · {TF} · MACD нижняя точка <code>{info['macd']:.6g}</code> (<0)",
         "",
-        f"👉 ENTRY: <code>{fmt_px(entry)}</code>",
-        f"ⓘ Структура: 0 <code>{fmt_px(info['p0'])}</code> → A <code>{fmt_px(info['pA'])}</code>",
-        f"🧱 Зелёный блок (цели от B): {block}",
+        f"👉 Куплено на <code>{fmt_px(px)}</code> на ${lot:g}",
+        f"📦 Всего лотов: {n} · вложено <b>${invested:g}</b> · средняя цена <code>{fmt_px(avg)}</code>",
+        f"🏦 Balance: {book.balance:,.2f} USDT",
         "",
-        f"🎯 TP1: <code>{fmt_px(info['tp1'])}</code> ({'+' if d == 1 else '−'}{p.tp1_pct:g}%) — закрою {p.tp1_frac * 100:g}%",
-        f"🎯 TP2: уровень 1.618 — закрою 100% позиции",
-        sl_txt,
-        "",
-        f"📊 Signals for pair: {pp['signals']}",
-        f"Prices in USDT. Плечо {lev:g}x — PnL считается на маржу, движение цены x{lev:g}.",
+        f"Продам всё, когда MACD коснётся высокой точки выше нуля.",
     ]))
 
 
-def part_pos(symbol, pos, px, frac, label, p):
-    """Частичная фиксация (TP1 +2% / TP2 1.618)."""
-    d = pos["dir"]
-    lev = pos.get("lev", 1.0)
-    notional = pos["entry_usd"] * frac * lev
-    pnl_usdt = notional * (px - pos["entry"]) / pos["entry"] * d
-    pnl_usdt -= _fees(notional, p)
-    pos["left_frac"] = max(pos["left_frac"] - frac, 0.0)
-    pos["tp1_done" if "TP1" in label else "tp2_done"] = True
-    book.balance += pnl_usdt
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    book.daily.setdefault(day, {"n": 0, "pnl": 0.0})
-    book.daily[day]["pnl"] += pnl_usdt
-    book.save()
-    log_event(f"PART {label} #{symbol} @ {fmt_px(px)}")
-    tg_send(NL.join([
-        f"💰 <b>Частичная фиксация — {label}</b>",
-        f"#{symbol} {TF} · {'🟢 LONG 📈' if d == 1 else '🔴 SHORT 📉'}",
-        f"👉 ENTRY: <code>{fmt_px(pos['entry'])}</code>",
-        f"✂️ Закрыто {frac * 100:g}% (${pos['entry_usd'] * frac:g}) по <code>{fmt_px(px)}</code>",
-        f"💵 PnL: <b>{pnl_usdt:+.2f} USDT</b>",
-        f"🧷 Остаток позиции: {pos['left_frac'] * 100:g}%",
-        f"🏦 Balance: {book.balance:,.2f} USDT",
-    ]), kb=True)
-
-
-def close_pos(symbol, pos, px, reason, p):
-    d = pos["dir"]
-    lev = pos.get("lev", 1.0)
-    frac = pos.get("left_frac", 1.0)
-    ret = (px - pos["entry"]) / pos["entry"] * 100 * d
-    notional = pos["entry_usd"] * frac * lev
-    pnl_usdt = notional * (px - pos["entry"]) / pos["entry"] * d
-    pnl_usdt -= _fees(notional, p)
-    won = pnl_usdt > 0
-    book.balance += pnl_usdt
+def sell_all(symbol, px, info, df, p):
+    """Продажа всей позиции на верхней точке MACD."""
+    pos = book.open.get(symbol)
+    if not pos or not pos["lots"]:
+        return
+    lots = pos["lots"]
+    invested = sum(l for _, l in lots)
+    proceeds = sum(l * px / e for e, l in lots)
+    fee = proceeds * p.fee_pct / 100.0
+    pnl = proceeds - fee - invested
+    book.balance += proceeds - fee
+    won = pnl > 0
     pp = book.per_pair.setdefault(symbol, {"signals": 0, "closed": 0, "wins": 0,
                                            "losses": 0, "pnl": 0.0})
     pp["closed"] += 1
-    pp["pnl"] += ret
+    ret_pct = (proceeds - fee) / invested * 100 - 100
+    pp["pnl"] += ret_pct
     if won:
         book.wins += 1
         pp["wins"] += 1
+        book.tps += 1
     else:
         book.losses += 1
         pp["losses"] += 1
-    if reason == "SL":
         book.sls += 1
-    elif reason == "TIME":
-        book.times += 1
-    else:
-        book.tps += 1
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     book.daily.setdefault(day, {"n": 0, "pnl": 0.0})
     book.daily[day]["n"] += 1
-    book.daily[day]["pnl"] += pnl_usdt
+    book.daily[day]["pnl"] += pnl
+    dur = max(int(time.time() - pos["opened"]) // 3600, 1)
     total = book.wins + book.losses
     wr = f"{book.wins / total * 100:.0f}%" if total else "—"
-    icon = "✅" if str(reason).startswith("TP") else ("⏱" if reason == "TIME" else "🛑")
-    title = {"TP2 1.618": "TAKE-PROFIT 1.618 (финал, 100%)", "SL": "STOP-LOSS",
-             "TIME": "TIME OUT", "BE": "БЕЗУБЫТОК"}.get(reason, reason)
-    dur = max(int(time.time() - pos["opened"]) // 3600, 1)
     book.save()
     del book.open[symbol]
-    log_event(("CLOSE " if not str(reason).startswith("TP") else "TP HIT ") + "#" + symbol + " " + str(reason) + " " + ("%+.2f%%" % ret))
-    tg_send(NL.join([
-        f"{icon} <b>Позиция закрыта — {title}</b>",
-        f"#{symbol} {TF} · {'🟢 LONG 📈' if d == 1 else '🔴 SHORT 📉'}",
-        f"👉 ENTRY: <code>{fmt_px(pos['entry'])}</code>",
-        f"🔚 EXIT: <code>{fmt_px(px)}</code> ({ret:+.2f}%)",
-        f"💰 PnL остатка: <b>{pnl_usdt:+.2f} USDT</b> (закрыто {frac * 100:g}%)",
-        f"🕐 Duration: ~{dur} h",
-        f"📊 Trades: {book.wins}W / {book.losses}L · winrate {wr} · balance {book.balance:,.2f} USDT",
-    ]), kb=True)
+    log.info("sell_all %s px=%s invested=%.2f pnl=%+.2f", symbol, px, invested, pnl)
+    log_event(f"SELL ALL #{symbol} @ {fmt_px(px)} {pnl:+.2f} USDT")
+    tg_photo(make_chart(symbol, df, None), NL.join([
+        f"{'✅' if won else '📉'} <b>MACD-DCA — продано ВСЁ</b> ({'профит' if won else 'убыток'})",
+        f"#{symbol} · {TF} · MACD высокая точка <code>{info['macd']:.6g}</code> (>0)",
+        "",
+        f"├ Лотов куплено: {len(lots)} на ${invested:g}",
+        f"├ Продано по: <code>{fmt_px(px)}</code>",
+        f"├ Выручка: ${proceeds - fee:,.2f} (комиссия {fee:.2f})",
+        f"├ PnL цикла: <b>{pnl:+.2f} USDT</b> ({ret_pct:+.2f}%)",
+        f"├ Держали: ~{dur} ч",
+        f"└ 📊 Циклов: {total} ({book.wins}W / {book.losses}L) · winrate {wr} · balance {book.balance:,.2f} USDT",
+    ]))
 
 
 # -------------------------------------------------------------- commands
@@ -513,7 +459,7 @@ def cmd_status():
     lines = [
         "📈 <b>Status</b>",
         f"├ Scanner: {'⏹ paused' if STATE['paused'] else '▶️ running'}",
-        f"├ Timeframe: {TF} · лонг/шорт фьючерсы {LONG_LEVERAGE:g}x/{SHORT_LEVERAGE:g}x",
+        f"├ Timeframe: {TF} · MACD-DCA спот · лот ${cfg().lot_usd:g} · макс. лотов {cfg().max_lots}",
         f"├ Universe: {len(STATE['universe'])} symbols",
         f"├ Last scan: {STATE.get('last_scan') or '—'}",
         f"├ Entries total: {STATE.get('entries', 0)}",
@@ -521,20 +467,24 @@ def cmd_status():
     ]
     for sym, p_ in book.open.items():
         age = max(int(time.time() - p_["opened"]) // 3600, 0)
-        lines.append(f"   {sym} {'LONG' if p_['dir'] == 1 else 'SHORT'} · entry {fmt_px(p_['entry'])} · age {age}h"
-                     + (" · TP1✓" if p_.get("tp1_done") else "") + (" · TP2✓" if p_.get("tp2_done") else "")
-                     + f" · left {p_.get('left_frac', 1) * 100:g}%")
+        lots = p_.get("lots") or []
+        invested = sum(l for _, l in lots)
+        avg = invested / sum(l / px for px, l in lots) if lots else 0
+        lines.append(f"   {sym} · {len(lots)} лотов · средняя {fmt_px(avg)} · вложено ${invested:g} · {age} ч")
     return NL.join(lines)
 
 
 def cmd_table():
     if not book.open:
         return "📋 No open positions"
-    rows = ["<code>Symbol       Entry          TP1(+2%)       SL(close<B)     Left   Age</code>"]
+    rows = ["<code>Symbol       Lots   AvgEntry        Invested   Age</code>"]
     for sym, p_ in book.open.items():
         age = f"{max(int(time.time() - p_['opened']) // 3600, 0)}h"
-        rows.append("<code>" + f"{sym:<12}{fmt_px(p_['entry']):<14}{fmt_px(p_['tp1']):<14}"
-                    f"{fmt_px(p_['fail_px']):<15}{p_.get('left_frac', 1) * 100:<5g}%{age}" + "</code>")
+        lots = p_.get("lots") or []
+        invested = sum(l for _, l in lots)
+        avg = invested / sum(l / px for px, l in lots) if lots else 0
+        rows.append("<code>" + f"{sym:<14}{len(lots):<6}{fmt_px(avg):<15}"
+                    f"${invested:<10g}{age}" + "</code>")
     return "📋 <b>Open positions</b>" + NL + NL.join(rows)
 
 
@@ -808,10 +758,10 @@ def main():
     tg_set_commands()
     tg_send(NL.join(["🤖 <b>SK System bot started</b>",
                      f"├ Universe: CoinGecko top-{len(STATE['universe'])} by market cap",
-                     "├ Timeframe: " + TF + " · стратегия 0→A→B (лонг/шорт фьючерсы)",
-                     "├ Сигнал: касание зоны B (0.5–0.786 от 0→A)",
-                     "├ TP1 +2% на 30% · TP2 (1.618) закрывает 100%",
-                     f"├ Вход ${cfg().entry_usd:g} · плечо {LONG_LEVERAGE:g}x лонг / {SHORT_LEVERAGE:g}x шорт · капитал ${cfg().capital_usd:g} · макс. {MAX_POS} позиций",
+                     "├ Timeframe: " + TF + " · MACD-DCA (спот, без плеча)",
+                     "├ Покупка $" + f"{cfg().lot_usd:g}" + " на каждой нижней точке MACD (<0), макс. лотов " + f"{cfg().max_lots}",
+                     "├ Продажа ВСЕГО на высокой точке MACD (>0)",
+                     f"├ Капитал ${book.start_balance:g} · макс. {MAX_POS} монет в работе · топ-{TOP_N} по капитализации",
                      f"└ Demo balance: {book.balance:,.2f} USDT"]), kb=True)
     threading.Thread(target=command_poller, daemon=True).start()
     threading.Thread(target=webcmd_watcher, daemon=True).start()

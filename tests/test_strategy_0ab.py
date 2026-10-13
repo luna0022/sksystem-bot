@@ -50,8 +50,9 @@ def base_uptrend_setup():
         bars.append((hi, hi, 112.0 - i * 0.5, 113.0 - i))
     # бар 25: A подтверждена (пивот с окном 15-25)
     bars.append((111.0, 112.0, 108.0, 109.5))
-    # бар 26: КАСАНИЕ ЗОНЫ B (топ зоны 105) -> сигнал, вход по закрытию 103
-    bars.append((108.0, 108.5, 104.0, 103.0))
+    # бар 26: КАСАНИЕ ЗОНЫ B (топ зоны 105) -> сигнал, вход по закрытию 105;
+    # бар валиден (закрытие >= лоя) и оттолкнулся от зоны (105 > лоя 104)
+    bars.append((108.0, 108.5, 104.0, 105.0))
     # 27-29: коррекция продолжается
     for i in range(3):
         hi = 105.0 - i * 0.7
@@ -83,11 +84,11 @@ def test_full_setup_tp1_tp2_tp3():
     sigs = [e for e in ev if e[0] == "sig"]
     assert len(sigs) == 1, f"ожидался 1 сигнал, получено {len(sigs)}: {ev}"
     _, entry, info = sigs[0]
-    assert entry == pytest.approx(103.0)
+    assert entry == pytest.approx(105.0)   # вход по закрытию валидного бара 26
     assert info["p0"] == pytest.approx(90.0)
     assert info["pA"] == pytest.approx(120.0)
     # TP1: +2%
-    assert info["tp1"] == pytest.approx(103.0 * 1.02)
+    assert info["tp1"] == pytest.approx(105.0 * 1.02)
     # блок на момент сигнала: оценка B по касанию = 104 (лоу бара 26)
     lv = dict(info["lv"])
     assert lv[1.618] == pytest.approx(104 + 1.618 * 30, abs=0.5)

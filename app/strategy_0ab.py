@@ -318,8 +318,10 @@ class SKTracker:
             events.append(("exit", pos["lv"][0][1], "TP2 1.618"))
             self._finish(i, "TP2")
             return events
-        # безубыток: после TP1 остаток закрываем по цене входа
-        if p.be_after_tp1 and pos["tp1_done"] and cl <= entry:
+        # безубыток: после TP1 остаток закрываем по цене входа;
+        # НЕ раньше следующего бара — иначе на баре входа cl == entry
+        # тождественно и БУ срабатывает мгновенно (особенно в шорте)
+        if p.be_after_tp1 and pos["tp1_done"] and i > pos["opened_i"] and cl <= entry:
             events.append(("exit", entry, "BE"))
             self._finish(i, "BE")
             return events
@@ -329,3 +331,30 @@ class SKTracker:
         self._last_exit_be = (reason == "BE")
         self._last_exit_i = i
         self.pos = None
+
+
+# ---------------------------------------------------------------- short side
+
+def invert_info(info):
+    """Цены из инвертированного пространства (шорт-трекер) -> реальные."""
+    out = dict(info)
+    for k in ("p0", "pA", "pB", "fail_px", "cat_sl", "tp1"):
+        if out.get(k) is not None:
+            out[k] = -out[k]
+    if out.get("lv"):
+        out["lv"] = [(lv, -px) for lv, px in out["lv"]]
+    return out
+
+
+def invert_event(ev):
+    """Событие шорт-трекера (инвертированные цены) -> реальные цены."""
+    if ev[0] == "sig":
+        _, entry, info = ev
+        return ("sig", -entry, invert_info(info))
+    if ev[0] == "part":
+        _, px, frac, label = ev
+        return ("part", -px, frac, label)
+    if ev[0] == "exit":
+        _, px, reason = ev
+        return ("exit", -px, reason)
+    return ev
